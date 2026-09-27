@@ -29,7 +29,7 @@
 - 中文政策：<https://manifoldor.github.io/xtags/privacy.zh-CN.html>
 - Support URL：<https://manifoldor.github.io/xtags/support.html>
 
-GitHub Pages 使用 `main` 分支的 `/docs`。提交商城前应按 [GITHUB_PAGES.md](GITHUB_PAGES.md) 匿名核对页面已更新，与包内 `extension/privacy/` 内容一致。现有公开页面的访问记录及本版发布步骤见该文件。
+GitHub Pages 使用 `main` 分支的 `/docs`。0.1.9 的公开政策与支持页已匿名核对，内容与包内 `extension/privacy/` 一致；验证记录及后续发布步骤见 [GITHUB_PAGES.md](GITHUB_PAGES.md)。
 
 ## 重建与验收
 

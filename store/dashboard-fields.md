@@ -1,6 +1,6 @@
 # 开发者后台填报内容
 
-**0.1.9 商城候选资料（2026-09-27）。** 填报前按 `GITHUB_PAGES.md` 核对公开政策已部署，并与当前运行包一致。
+**0.1.9 商城候选资料（2026-09-27）。** 公开政策已部署并与当前运行包一致；地址与验证记录见 `GITHUB_PAGES.md`。
 
 适用于 0.1.9 商城候选代码。以下为基于代码的数据分类建议，不替发布者勾选合规认证。
 
@@ -12,7 +12,7 @@
 - 中文短描述已在 `_locales/zh_CN/messages.json`；详细文案见 listing 文件。
 - 语言：English / 简体中文。
 - 分类建议：选择后台中最接近阅读辅助/工具的分类；不要把未经验证的概率标签归为安全检测或内容真实性认证工具。
-- Homepage / Support / Privacy URL：见 GITHUB_PAGES.md；发布后须匿名核对 0.1.9 的当前内容。
+- Homepage / Support / Privacy URL：见 GITHUB_PAGES.md；0.1.9 政策与支持页已匿名核对。
 
 ## Single purpose description（直接粘贴）
 
