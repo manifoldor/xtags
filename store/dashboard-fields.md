@@ -1,16 +1,18 @@
 # 开发者后台填报内容
 
-适用于 0.1.8 商城候选代码。上传前核对运行包版本、资料及已公开的 GitHub Pages 政策一致。以下为基于代码的数据分类建议，不替发布者勾选合规认证。
+**0.1.9 商城候选资料（2026-09-27）。** 填报前按 `GITHUB_PAGES.md` 核对公开政策已部署，并与当前运行包一致。
+
+适用于 0.1.9 商城候选代码。以下为基于代码的数据分类建议，不替发布者勾选合规认证。
 
 ## 名称、描述、分类
 
 - 名称：`Xtags`（以 manifest 为准，不添加“官方”“最佳”“免费无限”等词）。
-- 版本：`0.1.8`；最低 Chrome 版本：`140`。
+- 版本：`0.1.9`；最低 Chrome 版本：`140`。
 - 英文短描述已在 `_locales/en/messages.json`：`Label the intent behind posts on X with Jev, a model that returns probabilities rather than generated text.`
 - 中文短描述已在 `_locales/zh_CN/messages.json`；详细文案见 listing 文件。
 - 语言：English / 简体中文。
 - 分类建议：选择后台中最接近阅读辅助/工具的分类；不要把未经验证的概率标签归为安全检测或内容真实性认证工具。
-- Homepage / Support / Privacy URL：见 GITHUB_PAGES.md；0.1.8 已匿名验证，可访问内容与本地 `docs/` 一致。
+- Homepage / Support / Privacy URL：见 GITHUB_PAGES.md；发布后须匿名核对 0.1.9 的当前内容。
 
 ## Single purpose description（直接粘贴）
 

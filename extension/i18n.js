@@ -42,15 +42,25 @@
       withdrawalNote: "Withdrawal stops new requests; data already sent cannot be recalled. Your key and cache remain until you clear them.",
       errorConsentRequired: "Open Xtags Settings and review the data transfer notice before enabling classification.",
       apiKey: "API KEY",
-      apiKeyHint: "Stored locally. Sent only to the selected API service.",
+      apiKeyHint: "Saved locally when you leave this field. Sent only to the selected API service.",
       threshold: "Signal threshold",
       thresholdHint: "Applies to the three warning signals, not intent labels.",
       enabled: "Enabled",
       skipReplies: "Skip replies",
       showAll: "Show all signal probabilities",
       showHud: "Show status panel",
-      reset: "Clear cache",
-      resetDone: "Cache cleared",
+      reset: "Pause and clear cache",
+      resetDone: "Paused and cache cleared",
+      resetHint: "Stops new analysis and deletes local judgments. Keeps your API key. Enable Xtags again when you want to resume.",
+      settingsSaved: "Saved. Takes effect immediately.",
+      retryFailed: "Retry failed posts",
+      retryStarted: "Retry requested for open X pages.",
+      healthWaiting: "Enabled · waiting for a classification request",
+      healthOk: "Last API request succeeded",
+      labelDetails: "{intent} {probability}. View label details",
+      errorResponseTooLarge: "API response is too large. Check the service configuration.",
+      errorAuth: "API access failed. Check the key, provider credits and permissions in Settings.",
+      errorRateLimit: "The service is rate limiting requests. A limited retry will follow.",
       resetFailed: "Could not clear cache. Try again.",
       saveFailed: "Could not save settings. Try again.",
       loadFailed: "Could not load settings. Reopen this page.",
@@ -88,8 +98,8 @@
       errorCacheWrite: "Could not save the cache. Reloading may repeat requests.",
       errorTimeout: "The request timed out. Try again later.",
       errorNetwork: "Network request failed. Check your connection and try again.",
-      errorHttp: "API request failed: {detail}",
-      errorRequest: "Request failed: {detail}",
+      errorHttp: "API request failed. Check your service settings and retry.",
+      errorRequest: "Request failed. Retry or check Settings.",
     },
     zh: {
       subtitle: "每条帖子标出它想让你干什么",
@@ -131,15 +141,25 @@
       withdrawalNote: "撤回后停止新请求，已发送的数据无法撤回。key 和缓存会保留，直至你手动清除。",
       errorConsentRequired: "请打开 Xtags 设置，阅读数据传输说明并同意后再启用分类。",
       apiKey: "API KEY",
-      apiKeyHint: "存在本地，只用于调用当前 API 服务",
+      apiKeyHint: "移出输入框后保存到本地，只用于调用当前 API 服务",
       threshold: "触发阈值",
       thresholdHint: "三个信号超过它才标出来；意图标签不受影响",
       enabled: "启用",
       skipReplies: "跳过回复",
       showAll: "显示三个信号的数值",
       showHud: "显示右上角面板",
-      reset: "清空缓存",
-      resetDone: "已清空",
+      reset: "暂停并清空缓存",
+      resetDone: "已暂停并清空缓存",
+      resetHint: "停止后续分析并删除本地判断，保留 API key。需要继续时再启用 Xtags。",
+      settingsSaved: "已保存，立即生效",
+      retryFailed: "重试失败的帖子",
+      retryStarted: "已通知打开的 X 页面重试",
+      healthWaiting: "已启用，等待分类请求",
+      healthOk: "最近一次 API 请求成功",
+      labelDetails: "{intent} {probability}，查看标签详情",
+      errorResponseTooLarge: "API 响应过大，请检查服务配置",
+      errorAuth: "API 访问失败，请在设置中检查 key、服务额度和权限",
+      errorRateLimit: "服务暂时限流，将进行有限次数的重试",
       resetFailed: "清空失败，请重试",
       saveFailed: "设置保存失败，请重试",
       loadFailed: "设置加载失败，请重新打开页面",
@@ -177,8 +197,8 @@
       errorCacheWrite: "缓存保存失败；刷新后可能重新请求",
       errorTimeout: "请求超时，请稍后重试",
       errorNetwork: "网络请求失败，请检查连接后重试",
-      errorHttp: "API 请求失败：{detail}",
-      errorRequest: "请求失败：{detail}",
+      errorHttp: "API 请求失败，请检查服务设置后重试",
+      errorRequest: "请求失败，请重试或检查设置",
     },
   };
 
@@ -206,9 +226,10 @@
         return text.replace(/\{(\w+)\}/g, (match, name) => Object.hasOwn(values, name) ? String(values[name]) : match);
       },
       error(error) {
-        if (typeof error === "string") return error;
+        if (typeof error === "string") return api.t("errorRequest");
         const key = error?.code && Object.hasOwn(messages.en, error.code) ? error.code : "errorRequest";
-        return api.t(key, { detail: error?.detail || error?.message || "" });
+        const status = Number.isInteger(error?.status) && error.status >= 100 && error.status <= 599 ? ` (HTTP ${error.status})` : "";
+        return api.t(key) + status;
       },
     };
     return api;

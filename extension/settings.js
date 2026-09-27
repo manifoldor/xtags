@@ -19,6 +19,8 @@ const CHECKBOXES = ["enabled", "skipReplies", "showAll", "showHud"];
 let loaded = false;
 let consentBusy = false;
 let endpointBusy = false;
+let saving = false;
+let preferencesMessage = "";
 const state = { ...DEFAULTS };
 const earlyChanges = {};
 let resetMessage = "reset";
@@ -28,19 +30,20 @@ let resetTimer;
 function renderConsent() {
   const accepted = XtagsService.hasConsent(state, CONSENT_VERSION);
   const pendingEndpoint = endpointDirty();
+  $("language").disabled = !loaded || saving || consentBusy || endpointBusy;
   $("disclosureDetails").hidden = false;
   $("consentPrompt").hidden = accepted;
   $("consentGranted").hidden = !accepted;
-  $("grantConsent").disabled = !loaded || consentBusy || endpointBusy || pendingEndpoint || !$("consentCheck").checked;
-  $("consentCheck").disabled = !loaded || consentBusy || endpointBusy || pendingEndpoint;
-  $("revokeConsent").disabled = !loaded || consentBusy || endpointBusy;
+  $("grantConsent").disabled = !loaded || consentBusy || endpointBusy || saving || pendingEndpoint || !$("consentCheck").checked;
+  $("consentCheck").disabled = !loaded || consentBusy || endpointBusy || saving || pendingEndpoint;
+  $("revokeConsent").disabled = !loaded || consentBusy || endpointBusy || saving;
   $("settings").hidden = false;
-  $("settings").disabled = !loaded || consentBusy || endpointBusy || pendingEndpoint;
+  $("settings").disabled = !loaded || consentBusy || endpointBusy || saving || pendingEndpoint;
   $("enabled").disabled = !accepted;
   $("enabled").checked = accepted && state.enabled === true;
-  $("provider").disabled = !loaded || consentBusy || endpointBusy;
-  $("apiEndpoint").disabled = !loaded || consentBusy || endpointBusy;
-  $("saveEndpoint").disabled = !loaded || consentBusy || endpointBusy;
+  $("provider").disabled = !loaded || consentBusy || endpointBusy || saving;
+  $("apiEndpoint").disabled = !loaded || consentBusy || endpointBusy || saving;
+  $("saveEndpoint").disabled = !loaded || consentBusy || endpointBusy || saving;
   $("endpointField").hidden = $("provider").value !== "custom";
   $("endpointPending").hidden = !pendingEndpoint;
 }
@@ -49,6 +52,9 @@ function renderLanguage() {
   document.documentElement.lang = i18n.locale === "zh" ? "zh-CN" : "en";
   for (const el of document.querySelectorAll("[data-i18n]")) el.textContent = i18n.t(el.dataset.i18n);
   $("language").value = i18n.preference;
+  $("language").disabled = !loaded || saving || consentBusy || endpointBusy;
+  $("preferencesStatus").textContent = preferencesMessage ? i18n.t(preferencesMessage) : "";
+  $("preferencesStatus").hidden = !preferencesMessage;
   $("reset").textContent = i18n.t(resetMessage);
   $("status").textContent = statusMessage ? i18n.t(statusMessage) : "";
   $("status").hidden = !statusMessage;
@@ -86,16 +92,31 @@ async function load() {
   document.body.hidden = false;
 }
 
+function restoreFields(keys) {
+  for (const key of keys) {
+    if (CHECKBOXES.includes(key)) $(key).checked = !!state[key];
+    else if (key === "apiKey" || key === "threshold") $(key).value = state[key];
+  }
+}
 async function save(settings) {
+  if (!loaded || saving) return false;
+  saving = true;
+  renderConsent();
+  const preferences = Object.keys(settings).some((key) => ["apiKey", "threshold", ...CHECKBOXES].includes(key));
   try {
     await chrome.storage.local.set(settings);
     Object.assign(state, settings);
     statusMessage = "";
+    if (preferences) preferencesMessage = "settingsSaved";
     return true;
   } catch {
     statusMessage = "saveFailed";
+    if (preferences) preferencesMessage = "saveFailed";
     return false;
   } finally {
+    // Render committed state on both success and failure, never a failed draft.
+    restoreFields(Object.keys(settings));
+    saving = false;
     renderLanguage();
   }
 }
@@ -143,7 +164,7 @@ function editEndpoint() { $("consentCheck").checked = false; renderConsent(); }
 $("provider").addEventListener("change", editEndpoint);
 $("apiEndpoint").addEventListener("input", editEndpoint);
 $("saveEndpoint").addEventListener("click", async () => {
-  if (!loaded || consentBusy || endpointBusy) return;
+  if (!loaded || consentBusy || endpointBusy || saving) return;
   let endpoint;
   try { endpoint = XtagsService.normalize($("provider").value === "official" ? XtagsService.OFFICIAL_URL : $("apiEndpoint").value); }
   catch { statusMessage = "errorInvalidEndpoint"; renderLanguage(); return; }
@@ -168,7 +189,7 @@ $("saveEndpoint").addEventListener("click", async () => {
   finally { endpointBusy = false; renderLanguage(); }
 });
 async function changeConsent(accept) {
-  if (!loaded || consentBusy || endpointBusy || (accept && (endpointDirty() || !$("consentCheck").checked))) return;
+  if (!loaded || consentBusy || endpointBusy || saving || (accept && (endpointDirty() || !$("consentCheck").checked))) return;
   const consentEndpoint = state.apiEndpoint;
   consentBusy = true;
   renderConsent();
@@ -211,15 +232,25 @@ for (const id of CHECKBOXES) {
 }
 
 $("reset").addEventListener("click", async () => {
+  if (!loaded || saving || consentBusy || endpointBusy) return;
   clearTimeout(resetTimer);
+  saving = true;
+  renderLanguage();
   try {
-    await chrome.storage.local.set({ resetToken: crypto.randomUUID() });
+    await new Promise((resolve, reject) => chrome.runtime.sendMessage({ type: "xtags-clear-cache" }, (result) => {
+      if (chrome.runtime.lastError || !result?.ok) reject(new Error("Cache reset failed"));
+      else resolve();
+    }));
+    state.enabled = false;
     resetMessage = "resetDone";
+    preferencesMessage = "resetDone";
   } catch {
     resetMessage = "resetFailed";
+    preferencesMessage = "resetFailed";
   }
+  saving = false;
   renderLanguage();
-  resetTimer = setTimeout(() => { resetMessage = "reset"; renderLanguage(); }, 1200);
+  resetTimer = setTimeout(() => { resetMessage = "reset"; renderLanguage(); }, 1600);
 });
 
 (function renderByline() {

@@ -23,11 +23,11 @@
       enabled: saved.enabled === true, consentVersion: saved.consentVersion ?? 0,
       apiEndpoint: saved.apiEndpoint ?? 'https://api.typesafe.ai/v1/systemone',
       consentEndpoint: saved.consentEndpoint ?? 'https://api.typesafe.ai/v1/systemone',
-      model: saved.model ?? 'jev-latest', resetToken: saved.resetToken ?? 0,
+      model: saved.model ?? 'jev-latest', resetToken: saved.resetToken ?? 0, retryToken: saved.retryToken ?? 0,
       threshold: saved.threshold ?? .8, showAll: !!saved.showAll, skipReplies: saved.skipReplies !== false,
       showHud: saved.showHud !== false, language: saved.language ?? 'auto',
     });
-    const calls = [], listeners = [], timers = new Map(); let serial = 0;
+    const calls = [], cancellations = [], listeners = [], timers = new Map(); let serial = 0;
     w.setTimeout = (fn, delay) => { timers.set(++serial, { fn, delay }); return serial; };
     w.clearTimeout = id => timers.delete(id);
     async function set(obj) {
@@ -44,13 +44,17 @@
         session: { onChanged: { addListener: fn => listeners.push(fn) } },
       },
       runtime: { sendMessage: (msg, cb) => {
+        if (msg.type === 'jev-cancel') {
+          cancellations.push(msg);
+          calls.find(c => c.msg.requestId === msg.requestId)?.cb({ok:false, cancelled:true}); cb({ok:true}); return;
+        }
         if (msg.type !== 'xtags-config') { calls.push({ msg, cb }); return; }
         const snapshot = publicView(store);
         Promise.resolve().then(() => beforeRead?.(set)).then(() => cb({ ok: true, data: snapshot }));
       } },
     };
     w.eval(fixtures.serviceCode); w.eval(fixtures.translations); w.eval(fixtures.fullTextSource); w.eval(source); await w.ready; await flush();
-    return { w, store, calls, timers, set, a: w.audit,
+    return { w, store, calls, cancellations, timers, set, a: w.audit,
       async systemLanguage(value) { systemLanguage = value; w.dispatchEvent(new w.Event("languagechange")); await flush(); },
       badge(id) { return w.document.querySelector(`[data-xtags-badge="${id}"]`); },
       async reply(index, value = response()) { calls[index].cb({ ok: true, data: value }); await flush(); },
@@ -244,7 +248,7 @@
     await e.set({ language: 'zh' }); assert(hud().includes('已暂停'), 'paused status not Chinese');
   });
 
-  async function makePanel({ store = {}, systemLanguage = 'en-US', onSaved = async () => {}, beforeWrite = async () => {}, failRead = false, panel = 'settings', width = 760, failOpen = false, allowPermission = true } = {}) {
+  async function makePanel({ store = {}, systemLanguage = 'en-US', onSaved = async () => {}, beforeWrite = async () => {}, beforeClear = async () => {}, health = null, failHealth = false, failRead = false, panel = 'settings', width = 760, failOpen = false, allowPermission = true } = {}) {
     const frame = document.createElement('iframe'); frames.push(frame);
     frame.style.cssText = `width:${width}px;height:700px;border:0`; document.body.append(frame);
     const w = frame.contentWindow; w.document.open(); w.document.write(fixtures[panel + "Markup"]); w.document.close();
@@ -262,8 +266,10 @@
     w.chrome = {
       i18n: { getUILanguage: () => systemLanguage },
       permissions: { request: async value => { permissionRequests.push(value); return allowPermission; }, remove: async value => { removedPermissions.push(value); return true; } },
-      runtime: { getManifest: () => fixtures.manifest, openOptionsPage: async () => { if (failOpen) throw new Error("open failed"); opened++; } },
-      storage: { local: { get: async defaults => {
+      runtime: { sendMessage: (msg, cb) => {
+        if (msg.type === 'xtags-clear-cache') beforeClear().then(() => set({ enabled: false, resetToken: w.crypto.randomUUID() })).then(() => cb({ok:true}), () => cb({ok:false}));
+      }, getManifest: () => fixtures.manifest, openOptionsPage: async () => { if (failOpen) throw new Error("open failed"); opened++; } },
+      storage: { session: { get: async defaults => { if (failHealth) throw new Error('session unavailable'); return {...defaults, serviceHealth: health}; } }, local: { get: async defaults => {
         if (failRead) throw new Error('test read failure');
         return { ...defaults, ...structuredClone(store) };
       }, set: values => {
@@ -274,6 +280,7 @@
     w.eval(fixtures[panel + 'Code'].replace('load();', 'globalThis.popupReady = load();'));
     await w.popupReady; await flush();
     return { w, store, timers, set, permissionRequests, removedPermissions, get opened() { return opened; }, failWrites(value) { fail = value; },
+      async setHealth(value) { for (const fn of listeners) fn({serviceHealth: {newValue: value}}, 'session'); await flush(); },
       async choose(value) {
         const el = w.document.getElementById('language'); el.value = value; el.dispatchEvent(new w.Event('change'));
         await Promise.all(pendingWrites.splice(0)); await flush();
@@ -298,10 +305,10 @@
   await test('settings reset messages and write failures use the selected language', async () => {
     const e = await makePanel(); const doc = e.w.document;
     doc.getElementById('reset').click(); await flush();
-    assert(doc.getElementById('reset').textContent === 'Cache cleared', 'English reset missing');
-    await e.choose('zh'); assert(doc.getElementById('reset').textContent === '已清空', 'transient message not retranslated');
-    const timer = [...e.timers].find(([, timer]) => timer.ms === 1200); e.timers.delete(timer[0]); timer[1].fn();
-    assert(doc.getElementById('reset').textContent === '清空缓存', 'reset timer restored wrong language');
+    assert(doc.getElementById('reset').textContent === 'Paused and cache cleared', 'English reset missing');
+    await e.choose('zh'); assert(doc.getElementById('reset').textContent === '已暂停并清空缓存', 'transient message not retranslated');
+    const timer = [...e.timers].find(([, timer]) => timer.ms === 1600); e.timers.delete(timer[0]); timer[1].fn();
+    assert(doc.getElementById('reset').textContent === '暂停并清空缓存', 'reset timer restored wrong language');
     await e.choose('en'); e.failWrites(true); await e.choose('zh');
     assert(doc.getElementById('language').value === 'en' && !doc.getElementById('language').disabled, 'failed write kept unsaved choice');
     assert(!doc.getElementById('status').hidden && doc.getElementById('status').textContent.includes('Could not save'), 'save error missing');
@@ -464,6 +471,180 @@
     assert(e.calls.length === 2 && e.calls[1].msg.apiEndpoint === apiEndpoint, 'request not bound to new service');
     await e.reply(1);
     assert(!e.w.document.querySelector('[data-xtags-hud]').textContent.includes('≈$'), 'official pricing applied to custom provider');
+  });
+
+  await test('queued posts are revalidated after removal, reply changes and recycled text', async () => {
+    const e = await make({ data: {skipReplies: false}, html: ['1','2','3','4','5','6'].map(id => post(id, id === '5')).join('') });
+    assert(e.calls.length === 3, 'initial concurrency');
+    const articles = e.w.document.querySelectorAll('article');
+    articles[3].remove();
+    articles[5].querySelector('[data-testid="tweetText"]').textContent = 'Updated main post';
+    await e.set({skipReplies: true});
+    await e.reply(0); await e.reply(1); await e.reply(2);
+    assert(!e.calls.some(c => ['4','5'].includes(c.msg.id)), 'stale queue was sent');
+    assert(e.calls.length === 4 && e.calls[3].msg.state.post.text === 'Updated main post', 'recycled preview sent');
+    assert(!e.a.inflight.has('4') && !e.a.inflight.has('5'), 'stale job remained pending');
+  });
+  await test('the final dispatch guard drops recycled nodes even before mutation scan', async () => {
+    const e = await make({html: ['1','2','3','4'].map(id => post(id)).join('')});
+    const el = e.w.document.querySelectorAll('article')[3]; el.remove();
+    await e.reply(0);
+    assert(e.calls.length === 3 && !e.a.inflight.has('4'), 'removed post uploaded before next scan');
+  });
+  await test('removed running posts notify background; page hide cancels remaining consumers', async () => {
+    const e=await make({html:post('1')+post('2')});
+    e.w.document.querySelector('article').remove(); await flush(); await e.tick();
+    assert(e.cancellations.length===1 && e.cancellations[0].requestId===e.calls[0].msg.requestId,'missing background cancellation');
+    await e.reply(0); assert(!e.a.cache.has('1'),'cancelled result returned');
+    e.w.dispatchEvent(new e.w.Event('pagehide')); await flush();
+    assert(e.cancellations.length===2,'page hide kept consumers');
+  });
+  await test('content queue stays bounded and ignores unrelated page mutations', async () => {
+    const e = await make({html: Array.from({length: 130}, (_,i) => post(String(i + 1))).join('')});
+    assert(e.a.queue.length <= 100 && e.calls.length === 3, 'unbounded queue');
+    const aside = e.w.document.createElement('aside'); e.w.document.body.append(aside); await flush();
+    const before = e.w.extractCount;
+    for (let i = 0; i < 50; i++) aside.textContent = 'Trend ' + i;
+    await flush(); assert(e.w.extractCount === before && e.timers.size === 0, 'unrelated mutations scheduled extraction');
+  });
+  await test('quote-only cards are not mislabeled as their outer author', async () => {
+    for (const wrapper of ['<div role="link">', '<div data-testid="quoteTweet">', '<article data-testid="tweet">']) {
+      const close = wrapper.startsWith('<article') ? '</article>' : '</div>';
+      const quote = wrapper + '<a href="/bob/status/22"><time>now</time></a><div data-testid="tweetText">Quoted text</div>' + close;
+      const e = await make({html: '<article data-testid="tweet"><a href="/alice/status/11"><time>now</time></a>' + quote + '</article>'});
+      assert(!e.calls.some(c => c.msg.id === '11'), 'quote attached to outer ID');
+      if (wrapper.startsWith('<article')) assert(e.calls[0]?.msg.state.post.author === '@bob', 'nested article author wrong');
+    }
+  });
+  await test('main body, status author and reply marker stay outside quoted content', async () => {
+    const e = await make({html: '<article data-testid="tweet"><a href="/resharer">Reshared by</a><a href="/alice/status/11"><time>now</time></a>' +
+      '<div data-testid="tweetText">Main comment</div><div role="link"><a href="/bob/status/22"><time>now</time></a>' +
+      '<div>Replying to @someone</div><div data-testid="tweetText">Quote</div><button data-testid="tweet-text-show-more-link">more</button></div></article>'});
+    assert(e.calls.length === 1, 'quoted reply or show-more blocked main text');
+    assert(e.calls[0].msg.state.post.author === '@alice' && e.calls[0].msg.state.post.text === 'Main comment', 'author/body mismatch');
+    const bare = await make({html: post('12').replace('Post 12','Replying to the research in this main post').replace('</article>',
+      '<div role="link"><div>Replying to @quoted</div></div></article>')});
+    assert(bare.calls.length === 1, 'main body or quote wrapper was mistaken for a reply banner');
+  });
+  await test('transient failures retry on reconnect with a finite budget; manual retry resets it', async () => {
+    const e = await make({html: post('1')});
+    const fail = async index => { e.calls[index].cb({ok:false, code:'errorNetwork', retryable:true}); await flush(); };
+    await fail(0); assert([...e.timers.values()].some(t => t.delay === 15000), 'first retry not armed');
+    e.w.dispatchEvent(new e.w.Event('online')); await flush();
+    assert(e.calls.length === 2, 'reconnect did not retry'); await fail(1);
+    assert([...e.timers.values()].some(t => t.delay === 60000), 'second retry not delayed');
+    await e.tick(60000); assert(e.calls.length === 3, 'second automatic retry missing'); await fail(2);
+    for (let i = 0; i < 5; i++) { e.w.dispatchEvent(new e.w.Event('online')); e.a.scan(); await flush(); }
+    assert(e.calls.length === 3, 'automatic retry loop exceeded budget');
+    await e.set({retryToken: 'manual-1'}); assert(e.calls.length === 4, 'manual retry unavailable');
+    await e.reply(3); assert(e.badge('1') && e.a.failed.size === 0, 'recovered result absent');
+  });
+  await test('authentication errors never retry automatically and pause clears recovery timers', async () => {
+    const e = await make({html: post('1') + post('2')});
+    e.calls[0].cb({ok:false, code:'errorAuth', status:401, retryable:false});
+    e.calls[1].cb({ok:false, code:'errorTimeout', retryable:true}); await flush();
+    e.w.dispatchEvent(new e.w.Event('online')); await flush();
+    assert(e.calls.filter(c => c.msg.id === '1').length === 1, 'authentication error auto-retried');
+    assert(e.calls.filter(c => c.msg.id === '2').length === 2, 'timeout not retried');
+    e.calls[2].cb({ok:false, code:'errorTimeout', retryable:true}); await flush();
+    await e.set({enabled:false});
+    assert(![...e.timers.values()].some(t => [15000,60000].includes(t.delay)), 'pause left retry timers');
+    e.w.dispatchEvent(new e.w.Event('online')); await flush(); assert(e.calls.length === 3, 'paused upload');
+  });
+  await test('language repaint extracts 60 visible posts once with 3000 cached results', async () => {
+    const e = await make({data:{enabled:false}, html:Array.from({length:60},(_,i)=>post(String(i+1))).join('')});
+    for(let i=1;i<=3000;i++) { e.a.cache.set(String(i), response().answers); e.a.cacheText.set(String(i), 'Post '+i); }
+    await e.set({enabled:true}); assert(e.calls.length === 0, 'fixture cache missed');
+    e.w.extractCount = 0; await e.set({language:'en'});
+    assert(e.w.extractCount === 60, 'language scan count: '+e.w.extractCount);
+    assert(e.w.document.querySelectorAll('[data-xtags-badge]').length === 60, 'missing repaint');
+    assert(e.calls.length === 0 && e.timers.size === 0, 'repaint created network work or feedback loop');
+  });
+  await test('badge details support focus, keyboard, Escape and the actual X page theme', async () => {
+    const e = await make({html:post('1')}); await e.reply(0);
+    const badge = e.badge('1');
+    const focusEvents = [];
+    e.w.addEventListener('error', event => focusEvents.push(event.message));
+    for (const type of ['focus','blur']) badge.addEventListener(type, () => focusEvents.push(type));
+    assert(badge.tabIndex === 0 && badge.getAttribute('role') === 'button' && badge.getAttribute('aria-label'), 'not keyboard accessible');
+    // Let Chrome attach/layout the freshly created iframe before native focus.
+    await new Promise(resolve => e.w.requestAnimationFrame(resolve));
+    badge.focus(); await flush();
+    assert(e.w.document.querySelector('[role="tooltip"]') && badge.getAttribute('aria-describedby'), 'focus details absent: '+JSON.stringify({events:focusEvents,connected:badge.isConnected,active:e.w.document.activeElement?.outerHTML,body:e.w.document.body.innerHTML}));
+    e.w.dispatchEvent(new e.w.Event('scroll')); await flush();
+    assert(e.w.document.querySelector('[role="tooltip"]'), 'focus scrolling dismissed the description');
+    badge.dispatchEvent(new e.w.KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+    assert(!e.w.document.querySelector('[role="tooltip"]'), 'Escape did not dismiss');
+    badge.dispatchEvent(new e.w.KeyboardEvent('keydown',{key:'Enter',bubbles:true}));
+    assert(e.w.document.querySelector('[role="tooltip"]'), 'Enter did not reopen');
+    e.w.document.body.style.backgroundColor = 'black'; await flush();
+    assert(badge.firstChild.style.color === 'rgb(224, 229, 233)' && badge.firstChild.style.backgroundColor === 'rgb(41, 50, 56)', 'dark page not reflected');
+    e.w.document.body.style.backgroundColor = 'white'; await flush();
+    assert(badge.firstChild.style.color === 'rgb(68, 75, 80)', 'light page not reflected');
+    assert(e.calls.length === 1, 'details or theme requested judgment');
+  });
+  await test('failed settings writes restore the committed key, threshold and toggles', async () => {
+    const store = {apiKey:'saved-key', threshold:.8, consentVersion:2, enabled:true, skipReplies:true, showAll:false, showHud:true};
+    const e = await makePanel({store}); const doc = e.w.document; e.failWrites(true);
+    for (const [id, value] of [['apiKey','unsaved-key'],['threshold','.2'],['enabled',false],['skipReplies',false],['showAll',true],['showHud',false]]) {
+      const input = doc.getElementById(id); const saved = store[id];
+      if (typeof value === 'boolean') input.checked = value; else input.value = value;
+      input.dispatchEvent(new e.w.Event('change')); await flush();
+      assert((typeof value === 'boolean' ? input.checked : input.value) === (typeof value === 'boolean' ? saved : String(saved)), id+' retained failed draft');
+      assert(!doc.getElementById('preferencesStatus').hidden && doc.getElementById('preferencesStatus').textContent.includes('Could not save'), 'nearby failure hidden');
+    }
+    e.failWrites(false);
+    doc.getElementById('threshold').value = '.4'; doc.getElementById('threshold').dispatchEvent(new e.w.Event('change')); await flush();
+    assert(store.threshold === .4 && doc.getElementById('preferencesStatus').textContent.toLowerCase().includes('saved'), 'recovery not saved');
+  });
+  await test('pending preference saves disable concurrent edits and then restore controls', async () => {
+    let release;
+    const e = await makePanel({beforeWrite:()=>new Promise(resolve=>{release=resolve;})}); const doc=e.w.document;
+    doc.getElementById('threshold').value='.4'; doc.getElementById('threshold').dispatchEvent(new e.w.Event('change')); await flush();
+    assert(doc.getElementById('settings').disabled && doc.getElementById('language').disabled, 'concurrent edits allowed');
+    release(); await flush(); assert(!doc.getElementById('settings').disabled && e.store.threshold === .4, 'save did not settle');
+  });
+  await test('cache clearing waits for acknowledgement, pauses open pages and preserves credentials', async () => {
+    const page=await make({html:post('1')}); await page.reply(0);
+    let release;
+    const e=await makePanel({store:{apiKey:'saved-key',enabled:true,consentVersion:2},beforeClear:()=>new Promise(resolve=>{release=resolve;}),onSaved:values=>page.set(values)});
+    const doc=e.w.document; doc.getElementById('reset').click(); await flush();
+    assert(!doc.getElementById('reset').textContent.includes('cleared') && doc.getElementById('settings').disabled,'premature success');
+    release(); await flush(); page.a.scan(); await flush();
+    assert(e.store.enabled === false && e.store.apiKey === 'saved-key','did not pause or key lost');
+    assert(!page.badge('1') && page.calls.length === 1,'cache clear immediately reuploaded');
+    assert(doc.getElementById('reset').textContent.includes('cleared'),'acknowledged success absent');
+  });
+  await test('failed cache clearing shows failure instead of claiming deletion', async () => {
+    const e=await makePanel({beforeClear:async()=>{throw new Error('write failed');}});
+    e.w.document.getElementById('reset').click(); await flush();
+    assert(e.w.document.getElementById('preferencesStatus').textContent.includes('Could not clear'),'failure not shown');
+  });
+  await test('popup health is optional, ignores stale credentials and retries failed pages', async () => {
+    const store={enabled:true,consentVersion:2,apiKey:'test',keyRevision:'new',resetToken:'reset'};
+    const health={kind:'error',code:'errorAuth',status:401,keyRevision:'old',resetToken:'reset',endpoint:'https://api.typesafe.ai/v1/systemone'};
+    const e=await makePanel({panel:'popup',store,health}); const doc=e.w.document;
+    assert(!doc.getElementById('serviceHealth').textContent.includes('401'),'stale error shown');
+    health.keyRevision='new'; await e.setHealth(health);
+    assert(!doc.getElementById('retryFailed').hidden && doc.getElementById('serviceHealth').textContent.includes('401'),'request error hidden');
+    const threshold=doc.getElementById('threshold'); threshold.focus(); threshold.value='.4';
+    await e.setHealth({...health,kind:'ok'}); assert(Number(threshold.value) === .4,'diagnostics clobbered input draft');
+    assert(!doc.getElementById('retryFailed').hidden, 'last success hid recovery for other failed posts');
+    await e.setHealth(health); doc.getElementById('retryFailed').click(); await flush();
+    assert(typeof store.retryToken === 'string' && doc.getElementById('retryFailed').hidden,'retry signal not saved');
+    const noHealth=await makePanel({panel:'popup',store,failHealth:true});
+    assert(!noHealth.w.document.getElementById('quickSettings').disabled && !noHealth.w.document.body.hidden,'session failure disabled preferences');
+  });
+
+  await test('popup error and recovery controls fit the 360px layout in both languages', async () => {
+    for (const language of ['en','zh']) {
+      const e=await makePanel({panel:'popup',width:360,store:{language,apiKey:'test',enabled:true,consentVersion:2},
+        health:{kind:'error',code:'errorAuth',status:401,endpoint:'https://api.typesafe.ai/v1/systemone',keyRevision:'',resetToken:0}});
+      const doc=e.w.document;
+      assert(doc.documentElement.scrollWidth<=360 && doc.body.scrollWidth<=360,'popup horizontal overflow');
+      assert(doc.body.scrollHeight<=600, 'popup exceeds Chrome height');
+      assert(!doc.getElementById('retryFailed').hidden && !doc.getElementById('openSettings').hidden, 'recovery/settings hidden');
+    }
   });
 
   document.getElementById('results').textContent = JSON.stringify(results, null, 2);

@@ -43,11 +43,14 @@ The threshold accepts values from 0 to 1 and only affects these signals. You can
 ## Reliability and privacy
 
 - Post text and the author's handle are sent to the selected API service (TypeSafe by default) for classification. Your API key is stored in `chrome.storage.local` and sent only as authentication to the selected API service; it is not synced to a browser account. Persistent storage is restricted to trusted extension contexts. X-page content scripts receive only sanitized settings and a key-present flag. Local storage is not encrypted.
-- The background worker owns the persistent cache and deduplicates requests by post ID and content fingerprint across tabs. Changed text is classified again, and the cache does not persist raw post text. At most three requests run concurrently. Labels track their post ID when the timeline reuses DOM nodes.
+- The background worker owns the persistent cache and deduplicates requests by post ID and content fingerprint across tabs. Changed text is classified again, and responses are rebuilt from an allowlist before returning or caching them. The persistent cache stores neither raw text nor extra debug fields. It is limited to 3,000 entries / 2 MiB and writes only changed records. At most three requests run concurrently. Labels track their post ID when the timeline reuses DOM nodes.
 - Pausing stops queued requests and attempts to abort active ones. Requests already received by the provider may still incur charges.
-- Each attempt has a 20-second timeout. Network errors, HTTP 429, and server errors receive up to three attempts. Changed post text, fixing the key, or pausing and resuming lets failed posts be tried again.
+- Each attempt has a 20-second timeout. Network errors, HTTP 429, and server errors receive up to three attempts. After those attempts are exhausted, transient failures can start two further rounds after 15 and 60 seconds (up to nine total API attempts). Reconnecting can trigger a remaining round early. Authentication, permission and response-format errors are not automatically retried. The popup shows the last API status and provides Retry failed posts. Changing the text or fixing the key also permits retrying; pausing cancels recovery timers.
+- Queued posts are revalidated against their current main body, author and reply setting. Each page queue is capped at 100 entries. Removed or changed posts release their background requests, while other tabs can continue sharing the same job. Quote-only text is never assigned to an outer author.
+- **Pause and clear cache** in Settings waits for deletion, retains your key and leaves processing paused until you enable it again. Failed preference writes restore the saved controls and show an error.
+- Labels follow the actual page theme and support focus, Enter/Space, click and Escape for their details. Intent and probability remain visible.
 - Language and threshold changes reuse raw cached probabilities. Cache versions are incremented when the response format or classification criteria change, so judgments made with older questions are rebuilt.
-- There is no analytics or telemetry. Counters are held in the current tab's memory. Cost estimates exclude other tabs and any charges from failed requests.
+- There is no analytics or telemetry. Counters are held in the current tab's memory. Only controlled status/error codes, HTTP status and the latest request time are kept in temporary session storage; provider error bodies are not retained. Cost estimates exclude other tabs and any charges from failed requests.
 
 AI labels can be wrong. They are predictions about text, not established facts about a person or a post. This project is independent and not affiliated with, authorized, or endorsed by X Corp. It is intended for personal browsing assistance. Review the [usage notice](README.md) and [MIT license](LICENSE).
 
@@ -64,7 +67,7 @@ Set `CHROME_BIN` if your browser is installed outside a default location. Tests 
 
 ## Chrome Web Store preparation
 
-See [submission materials](store/README.md) for listing copy, artwork, permission explanations, reviewer instructions and remaining checks. The [English privacy policy](https://manifoldor.github.io/xtags/privacy.html), [Chinese policy](https://manifoldor.github.io/xtags/privacy.zh-CN.html) and [support page](https://manifoldor.github.io/xtags/support.html) are published on GitHub Pages; their source is in `docs/`. Rebuild the candidate package with `python3 scripts/package-store.py`. The in-product notice is implemented; live testing and reviewer access preparation remain before submission.
+See [submission materials](store/README.md) for listing copy, artwork, permission explanations, reviewer instructions and remaining checks. The [English privacy policy](https://manifoldor.github.io/xtags/privacy.html), [Chinese policy](https://manifoldor.github.io/xtags/privacy.zh-CN.html) and [support page](https://manifoldor.github.io/xtags/support.html) are published from `docs/` on the `main` branch. See the [0.1.9 release notes](store/RELEASE_NOTES_0.1.9.md). Rebuild the candidate package with `python3 scripts/package-store.py`. Live testing and reviewer access preparation remain before submission.
 
 Version 0.1.3 adds a prominent data-transfer notice, explicit opt-in and withdrawal. Both new and existing installations require current consent before classification. English and Chinese privacy policies are bundled for offline access.
 
@@ -73,3 +76,5 @@ Version 0.1.4 moves disclosure, consent, API key configuration, cache clearing a
 Version 0.1.5 adds custom HTTPS API endpoints. TypeSafe remains the default. Custom providers must support the TypeSafe System One request/response format; OpenAI chat APIs are not supported. Saving a different URL clears the old key and cache, pauses processing and requires consent to the new destination. Configure a key issued for that service. Custom hosts are authorized individually.
 
 Version 0.1.8 refines the existing criteria without changing the label categories, classifies collapsed long posts from their full text before expansion, and restricts the API key to trusted extension contexts. Existing users must renew data-transfer consent. Chrome 140 or later is required.
+
+Version 0.1.9 fixes quoted-text attribution and stale uploads, adds bounded recovery from transient errors, limits and sanitizes provider responses, and improves theme contrast, keyboard details and save feedback. Clearing the cache now pauses processing first.

@@ -27,6 +27,7 @@
     showHud: true,
     resetToken: 0,
     language: "auto",
+    retryToken: 0,
   };
 
   // 内容脚本只接收不含 API key 的临时设置；请求和持久化缓存统一交给后台。
@@ -43,6 +44,8 @@
 
   const MAX_INFLIGHT = 3;
   const CACHE_LIMIT = 3000;
+  const MAX_QUEUE = 100;
+  const RETRY_DELAYS = [15000, 60000];
   const FULL_TEXT_RETRY_DELAYS = [500, 1500, 3500];
 
   /**
@@ -64,14 +67,14 @@
    * 不该变。这也是为什么橙和红那两档还额外加了字重。
    */
   const LEVELS = {
-    calm: { fg: "#555555", bg: "rgba(85,85,85,.09)", weight: 500 },
-    playful: { fg: "#15803d", bg: "rgba(21,128,61,.10)", weight: 500 },
-    misc: { fg: "#0f766e", bg: "rgba(15,118,110,.10)", weight: 500 },
-    notice: { fg: "#1d4ed8", bg: "rgba(29,78,216,.10)", weight: 500 },
-    amber: { fg: "#a16207", bg: "rgba(161,98,7,.12)", weight: 500 },
-    violet: { fg: "#6d28d9", bg: "rgba(109,40,217,.11)", weight: 500 },
-    caution: { fg: "#c2410c", bg: "rgba(194,65,12,.13)", weight: 600 },
-    alarm: { fg: "#b91c1c", bg: "rgba(185,28,28,.14)", weight: 600 },
+    calm: { fg: "#444b50", bg: "#edf0f2", darkFg: "#e0e5e9", darkBg: "#293238", weight: 500 },
+    playful: { fg: "#166534", bg: "#e7f3eb", darkFg: "#a7f3b5", darkBg: "#153725", weight: 500 },
+    misc: { fg: "#115e59", bg: "#e4f2f0", darkFg: "#99f6e4", darkBg: "#133b37", weight: 500 },
+    notice: { fg: "#1e40af", bg: "#e8eefb", darkFg: "#bfdbfe", darkBg: "#182f54", weight: 500 },
+    amber: { fg: "#854d0e", bg: "#fff1d6", darkFg: "#fde68a", darkBg: "#3f2e10", weight: 500 },
+    violet: { fg: "#6b21a8", bg: "#f1e9fc", darkFg: "#e9d5ff", darkBg: "#36204e", weight: 500 },
+    caution: { fg: "#9a3412", bg: "#fff0e5", darkFg: "#fed7aa", darkBg: "#482712", weight: 600 },
+    alarm: { fg: "#991b1b", bg: "#fde9e9", darkFg: "#fecaca", darkBg: "#471f25", weight: 600 },
   };
 
   const i18n = XtagsI18n.create();
@@ -100,6 +103,8 @@
   const failed = new Map();
   const skipped = new Set();
   let queue = [];
+  let pagePosts = new Map();
+  let queueOverflow = false;
   let active = 0;
   let generation = 0;
   let lastContainerCount = 0;
@@ -149,11 +154,11 @@
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage({
         type: "jev-ask",
-        apiEndpoint: serviceConfig.apiEndpoint, id: job.id, state: job.state, model: MODEL, resetToken: RESET_TOKEN,
+        requestId: job.requestId, apiEndpoint: serviceConfig.apiEndpoint, id: job.id, isReply: job.isReply, state: job.state, model: MODEL, resetToken: RESET_TOKEN,
       }, (res) => {
-        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (chrome.runtime.lastError) return reject(Object.assign(new Error("Background unavailable"), { code: "errorNoResponse", retryable: true }));
         if (!res) return reject(Object.assign(new Error("background did not respond"), { code: "errorNoResponse" }));
-        if (!res.ok) return reject(Object.assign(new Error(res.error), { cancelled: res.cancelled, code: res.code }));
+        if (!res.ok) return reject(Object.assign(new Error(res.error), { cancelled: res.cancelled, code: res.code, status: res.status, retryable: res.retryable }));
         resolve(res.data);
       });
     });
@@ -162,27 +167,85 @@
   function invalidateRequests() {
     generation++;
     queue = [];
+    for (const job of inflight.values()) cancelJob(job);
     inflight.clear();
-    failed.clear();
+    clearFailures();
     for (const retry of fullTextRetries.values()) if (retry.timer !== null) clearTimeout(retry.timer);
     fullTextRetries.clear();
   }
 
+  function cancelJob(job) {
+    if (!job.running || job.cancelled) return;
+    job.cancelled = true;
+    const failure = failed.get(job.id);
+    if (failure) failure.ready = true;
+    try {
+      chrome.runtime.sendMessage({ type: "jev-cancel", requestId: job.requestId }, () => { void chrome.runtime.lastError; });
+    } catch { /* The background also checks settings before sending. */ }
+  }
+
+  function clearFailure(id) {
+    const entry = failed.get(id);
+    if (entry?.timer !== null && entry?.timer !== undefined) clearTimeout(entry.timer);
+    failed.delete(id);
+  }
+  function clearFailures() {
+    for (const id of failed.keys()) clearFailure(id);
+  }
+  function armRetry(id, entry) {
+    if (!entry.retryable || entry.attempts >= RETRY_DELAYS.length || entry.timer !== null) return;
+    entry.timer = setTimeout(() => {
+      entry.timer = null;
+      if (failed.get(id) !== entry) return;
+      entry.ready = true;
+      scan();
+    }, RETRY_DELAYS[entry.attempts]);
+  }
+  function retryFailures(manual = false) {
+    for (const [id, entry] of failed) {
+      if (!manual && (!entry.retryable || entry.attempts >= RETRY_DELAYS.length)) continue;
+      if (entry.timer !== null) clearTimeout(entry.timer);
+      entry.timer = null;
+      entry.ready = true;
+      if (manual) entry.attempts = -1;
+    }
+    if (booted) scan();
+  }
+  window.addEventListener("online", () => retryFailures());
+  window.addEventListener("pagehide", invalidateRequests);
+  window.addEventListener("pageshow", (event) => { if (event.persisted && booted) scan(); });
+
+  function matchesJob(job, record) {
+    return record && record.el.isConnected && !record.post.incomplete &&
+      !(SKIP_REPLIES && record.reply) && record.post.text === job.state.post.text &&
+      (record.post.author ? `@${record.post.author}` : null) === job.state.post.author;
+  }
+  function currentRecord(job) {
+    for (const record of pagePosts.get(job.id) || []) {
+      if (!record.el.isConnected) continue;
+      const post = extract(record.el);
+      const now = post?.id === job.id ? { el: record.el, post, reply: isReply(record.el) } : null;
+      if (matchesJob(job, now)) return now;
+    }
+    return null;
+  }
   function pump() {
     if (!CONSENTED || !ENABLED || !HAS_KEY) return;
     while (active < MAX_INFLIGHT && queue.length > 0) {
       const job = queue.shift();
+      // DOM nodes can be recycled between a scan and a free request slot.
+      if (!currentRecord(job)) {
+        if (inflight.get(job.id) === job) inflight.delete(job.id);
+        scheduleScan();
+        continue;
+      }
+      job.running = true;
+      job.requestId = crypto.randomUUID();
       active++;
       ask(job)
         .then((r) => {
-          if (job.generation !== generation || !CONSENTED || !ENABLED || !HAS_KEY) return;
-          const currentElement = [...document.querySelectorAll(POST_SELECTOR)].find((el) =>
-            findTimeAnchor(el)?.getAttribute("href")?.match(/status\/(\d+)/)?.[1] === job.id);
-          const currentPost = currentElement ? extract(currentElement) : null;
-          if (currentPost && (currentPost.incomplete || currentPost.text !== job.state.post.text)) {
-            scheduleScan();
-            return;
-          }
+          if (job.cancelled || job.generation !== generation || !CONSENTED || !ENABLED || !HAS_KEY) return;
+          if (!currentRecord(job)) { scheduleScan(); return; }
           const verdict = compose(r.answers);
           stats.asked++;
           stats.tokens += r.usage?.input_tokens ?? 0;
@@ -192,25 +255,34 @@
           cacheText.set(job.id, job.state.post.text);
           while (cache.size > CACHE_LIMIT) {
             const oldest = cache.keys().next().value;
-            cache.delete(oldest);
-            cacheText.delete(oldest);
+            cache.delete(oldest); cacheText.delete(oldest);
           }
-          if (r.warning) stats.lastError = { code: r.warningCode, detail: r.warning };
+          clearFailure(job.id);
+          stats.failed = failed.size;
+          if (!failed.size) stats.lastError = "";
+          if (r.warning) stats.lastError = { code: r.warningCode };
           paint(job.id);
         })
         .catch((e) => {
-          if (job.generation !== generation || e.cancelled) return;
-          stats.failed++;
-          stats.lastError = { code: e.code, detail: e.message };
-          failed.set(job.id, job.state.post.text);
-          console.warn("[xtags] 请求失败:", e.message);
-          scheduleScan(); // The post may have gained a different body while this request was running.
+          if (job.cancelled || job.generation !== generation || e.cancelled) return;
+          const entry = { text: job.state.post.text, attempts: job.retryAttempt || 0, ready: false, timer: null,
+            code: e.code || "errorRequest", status: e.status,
+            retryable: typeof e.retryable === "boolean" ? e.retryable :
+              ["errorNetwork", "errorTimeout", "errorNoResponse", "errorQueueFull"].includes(e.code) };
+          clearFailure(job.id);
+          failed.set(job.id, entry);
+          while (failed.size > CACHE_LIMIT) clearFailure(failed.keys().next().value);
+          stats.failed = failed.size;
+          stats.lastError = { code: entry.code, status: entry.status };
+          armRetry(job.id, entry);
+          scheduleScan();
         })
         .finally(() => {
           active--;
           if (inflight.get(job.id) === job) inflight.delete(job.id);
           refreshUi();
           pump();
+          if (queueOverflow) scheduleScan();
         });
     }
   }
@@ -227,19 +299,26 @@
    */
   const REPLY_PREFIX = /^(Replying to|回复|正在回复)/;
 
+  function belongsToPost(node, article) {
+    if (node.closest(POST_SELECTOR) !== article) return false;
+    if (node.matches('div[role="link"], [data-testid="quoteTweet"]')) return false;
+    for (let parent = node.parentElement; parent && parent !== article; parent = parent.parentElement) {
+      if (parent.matches('[role="link"], [data-testid="quoteTweet"]')) return false;
+    }
+    return true;
+  }
   function isReply(el) {
-    // 只扫前若干个 div：回复提示在顶部，全量扫描在大时间线上很贵。
-    const divs = el.querySelectorAll("div");
-    const limit = Math.min(divs.length, 12);
-    for (let i = 0; i < limit; i++) {
-      const t = (divs[i].textContent || "").trim();
-      if (t.length > 0 && t.length < 30 && REPLY_PREFIX.test(t)) return true;
+    for (const div of el.querySelectorAll("div")) {
+      if (!belongsToPost(div, el) || div.closest('[data-testid="tweetText"], [data-xtags-badge]')) continue;
+      if (div.querySelector('[data-testid="tweetText"], article[data-testid="tweet"]')) continue;
+      const text = (div.textContent || "").trim();
+      if (text.length > 0 && text.length < 200 && REPLY_PREFIX.test(text)) return true;
     }
     return false;
   }
 
   function extract(el) {
-    const textEl = el.querySelector('[data-testid="tweetText"]');
+    const textEl = [...el.querySelectorAll('[data-testid="tweetText"]')].find((node) => belongsToPost(node, el));
     if (!textEl) return null;
 
     let text = textEl.innerText.trim();
@@ -253,7 +332,7 @@
     // only the preview. Never send that preview as if it were the whole post.
     let incomplete = false;
     const folded = [...el.querySelectorAll('[data-testid="tweet-text-show-more-link"]')]
-      .some((button) => !button.closest('[role="link"]'));
+      .some((button) => belongsToPost(button, el));
     if (folded || knownLong.has(id)) {
       const token = ++fullTextToken;
       let result = null;
@@ -271,7 +350,7 @@
       } finally {
         el.removeEventListener("xtags:fulltext-response", receive);
       }
-      if (typeof result === "string" && result.trim()) {
+      if (typeof result === "string" && result.length <= 100000 && result.trim()) {
         text = result;
         knownLong.delete(id);
         knownLong.add(id);
@@ -279,14 +358,8 @@
       } else incomplete = folded;
     }
 
-    let author = null;
-    for (const link of el.querySelectorAll('a[href^="/"]')) {
-      const href = link.getAttribute("href");
-      if (href && /^\/[A-Za-z0-9_]{1,15}$/.test(href)) {
-        author = href.slice(1);
-        break;
-      }
-    }
+    // Keep author and body tied to the same outer status link, not a repost attribution.
+    const author = statusLink.getAttribute("href").match(/^(?:https:\/\/(?:x|twitter)\.com)?\/([A-Za-z0-9_]{1,15})\/status\//)?.[1] ?? null;
 
     return { id, text, author, incomplete };
   }
@@ -300,10 +373,11 @@
     const s = LEVELS[level] ?? LEVELS.calm;
     const pill = document.createElement("span");
     pill.textContent = text;
+    pill.dataset.xtagsLevel = level;
     // 没有竖线、没有边框——只有底色和字色，靠色相和字重区分。
     pill.style.cssText =
       `display:inline-flex;align-items:center;padding:1px 7px;border-radius:3px;` +
-      `white-space:nowrap;background:${s.bg};color:${s.fg};` +
+      `white-space:nowrap;background:${pageIsDark ? s.darkBg : s.bg};color:${pageIsDark ? s.darkFg : s.fg};` +
       `font-weight:${s.weight};letter-spacing:.01em;`;
     return pill;
   }
@@ -312,9 +386,12 @@
    * 主帖的时间戳链接：header 行里第一个指向 /status/ 且内含 <time> 的 <a>。
    * 取"第一个"是有意的——引用转推里也会有 <time>，但它排在主帖之后。
    */
+  function badgeIn(el) {
+    return [...el.querySelectorAll(`[${BADGE_ATTR}]`)].find((node) => belongsToPost(node, el));
+  }
   function findTimeAnchor(el) {
     for (const a of el.querySelectorAll('a[href*="/status/"]')) {
-      if (a.querySelector("time")) return a;
+      if (a.querySelector("time") && belongsToPost(a, el)) return a;
     }
     return null;
   }
@@ -324,6 +401,20 @@
     const wrap = document.createElement("span");
     wrap.setAttribute(BADGE_ATTR, id);
     wrap.title = entry.tip;
+    wrap.tabIndex = 0;
+    wrap.setAttribute("role", "button");
+    wrap.setAttribute("aria-label", i18n.t("labelDetails", { intent: entry.intent, probability: entry.intentP.toFixed(2) }));
+    wrap.addEventListener("focus", () => { wrap.style.outline = "2px solid #5985ba"; showTip(wrap, entry.tip); });
+    wrap.addEventListener("blur", () => { wrap.style.outline = ""; hideTip(); });
+    wrap.addEventListener("mouseenter", () => showTip(wrap, entry.tip));
+    wrap.addEventListener("mouseleave", () => { if (document.activeElement !== wrap) hideTip(); });
+    wrap.addEventListener("click", (event) => { event.stopPropagation(); event.preventDefault(); showTip(wrap, entry.tip); });
+    wrap.addEventListener("keydown", (event) => {
+      if (["Enter", " ", "Escape"].includes(event.key)) {
+        event.preventDefault(); event.stopPropagation();
+        if (event.key === "Escape") hideTip(); else showTip(wrap, entry.tip);
+      }
+    });
     wrap.lang = i18n.locale === "zh" ? "zh-CN" : "en";
     wrap.style.cssText =
       "display:inline-flex;flex-wrap:wrap;align-items:center;gap:4px;margin-left:8px;max-width:calc(100% - 8px);" +
@@ -345,7 +436,7 @@
 
   function showIncomplete(el, id) {
     scheduleFullTextRetry(id);
-    const existing = el.querySelector(`[${BADGE_ATTR}]`);
+    const existing = badgeIn(el);
     if (existing?.getAttribute("data-xtags-incomplete") === "true") return;
     existing?.remove();
     const anchor = findTimeAnchor(el);
@@ -385,78 +476,100 @@
     while (fullTextRetries.size > CACHE_LIMIT) clearFullTextRetry(fullTextRetries.keys().next().value);
   }
 
+  function paintRecord(record, entry) {
+    const { el, post, reply } = record;
+    if (post.incomplete || cacheText.get(post.id) !== post.text || (SKIP_REPLIES && reply)) return;
+    const existing = badgeIn(el);
+    existing?.remove();
+    const anchor = findTimeAnchor(el);
+    if (anchor?.parentElement) anchor.parentElement.insertBefore(makeBadge(post.id, entry), anchor.nextSibling);
+  }
   function paint(id) {
     const answers = cache.get(id);
     if (!CONSENTED || !ENABLED || !HAS_KEY || !answers) return;
     const entry = compose(answers);
-    for (const el of document.querySelectorAll(POST_SELECTOR)) {
-      const post = extract(el);
-      if (!post || post.id !== id || post.incomplete || cacheText.get(id) !== post.text || (SKIP_REPLIES && isReply(el))) continue;
-
-      const existing = el.querySelector(`[${BADGE_ATTR}]`);
-      if (existing) existing.remove();
-
-      const anchor = findTimeAnchor(el);
-      if (!anchor || !anchor.parentElement) continue;
-      anchor.parentElement.insertBefore(makeBadge(id, entry), anchor.nextSibling);
+    for (const record of pagePosts.get(id) || []) {
+      if (!record.el.isConnected) continue;
+      const post = extract(record.el);
+      if (post?.id === id) paintRecord({ el: record.el, post, reply: isReply(record.el) }, entry);
     }
   }
-
   function clearBadges() {
+    hideTip();
     for (const el of document.querySelectorAll(`[${BADGE_ATTR}]`)) el.remove();
   }
 
-  // ── 主循环 ────────────────────────────────────────────────────────────────
-  function scan() {
+  // Each pass extracts the current DOM once, regardless of historical cache size.
+  function scan({ repaint = false, request = true } = {}) {
     if (!CONSENTED || !ENABLED || !HAS_KEY) return;
-
     const containers = document.querySelectorAll(POST_SELECTOR);
-    const seenPostIds = new Set();
     lastContainerCount = containers.length;
-
+    const records = [];
+    pagePosts = new Map();
     for (const el of containers) {
-      const post = extract(el);
-      const existing = el.querySelector(`[${BADGE_ATTR}]`);
-      const skip = SKIP_REPLIES && isReply(el);
-      if (existing && (!post || skip || existing.getAttribute(BADGE_ATTR) !== post.id)) existing.remove();
+      const post = extract(el), reply = isReply(el);
+      const existing = badgeIn(el);
+      if (existing && (!post || (SKIP_REPLIES && reply) || existing.getAttribute(BADGE_ATTR) !== post.id)) existing.remove();
       if (!post) continue;
-      seenPostIds.add(post.id);
-      if (skip) {
+      const record = { el, post, reply };
+      records.push(record);
+      if (!pagePosts.has(post.id)) pagePosts.set(post.id, []);
+      pagePosts.get(post.id).push(record);
+    }
+    // Prune before admitting replacements so recycled bodies can be queued immediately.
+    for (const job of inflight.values()) {
+      if (job.running && !(pagePosts.get(job.id) || []).some((record) => matchesJob(job, record))) {
+        cancelJob(job);
+        inflight.delete(job.id);
+      }
+    }
+    queue = queue.filter((job) => {
+      if ((pagePosts.get(job.id) || []).some((record) => matchesJob(job, record))) return true;
+      if (inflight.get(job.id) === job) inflight.delete(job.id);
+      const failure = failed.get(job.id);
+      if (failure) failure.ready = true;
+      return false;
+    });
+    queueOverflow = false;
+    for (const record of records) {
+      const { el, post, reply } = record;
+      if (SKIP_REPLIES && reply) {
         skipped.add(post.id);
+        while (skipped.size > CACHE_LIMIT) skipped.delete(skipped.values().next().value);
         continue;
       }
-      if (post.incomplete) {
-        showIncomplete(el, post.id);
-        continue;
-      }
+      if (post.incomplete) { showIncomplete(el, post.id); continue; }
       clearFullTextRetry(post.id);
+      const existing = badgeIn(el);
       if (existing?.getAttribute("data-xtags-incomplete") === "true") existing.remove();
       if (cache.has(post.id) && cacheText.get(post.id) !== post.text) {
-        cache.delete(post.id);
-        cacheText.delete(post.id);
-        el.querySelector(`[${BADGE_ATTR}]`)?.remove();
+        cache.delete(post.id); cacheText.delete(post.id);
+        badgeIn(el)?.remove();
       }
       if (cache.has(post.id)) {
-        if (!el.querySelector(`[${BADGE_ATTR}]`)) paint(post.id);
+        if (repaint || !badgeIn(el)) paintRecord(record, compose(cache.get(post.id)));
         continue;
       }
-      if (failed.has(post.id) && failed.get(post.id) !== post.text) failed.delete(post.id);
-      if (inflight.has(post.id) || failed.has(post.id)) continue;
-
-      const job = {
-        id: post.id,
-        generation,
-        state: { post: { author: post.author ? `@${post.author}` : null, text: post.text } },
-      };
-      inflight.set(post.id, job);
-      stats.seen++;
-      queue.push(job);
+      if (!request) continue;
+      if (failed.has(post.id) && failed.get(post.id).text !== post.text) clearFailure(post.id);
+      const failure = failed.get(post.id);
+      if (inflight.has(post.id) || (failure && !failure.ready)) continue;
+      if (queue.length >= MAX_QUEUE) { queueOverflow = true; continue; }
+      const job = { id: post.id, generation, isReply: reply, retryAttempt: failure ? failure.attempts + 1 : 0,
+        state: { post: { author: post.author ? `@${post.author}` : null, text: post.text } } };
+      if (failure) failure.ready = false;
+      inflight.set(post.id, job); stats.seen++; queue.push(job);
     }
-    for (const id of fullTextRetries.keys()) if (!seenPostIds.has(id)) clearFullTextRetry(id);
+    // Prioritize posts near the viewport while keeping a small prefetch queue.
+    const distances = new Map(queue.map((job) => {
+      const rect = pagePosts.get(job.id)?.[0]?.el.getBoundingClientRect();
+      return [job, rect ? Math.max(0, -rect.bottom, rect.top - window.innerHeight) : Infinity];
+    }));
+    queue.sort((a, b) => distances.get(a) - distances.get(b));
+    for (const id of fullTextRetries.keys()) if (!pagePosts.has(id)) clearFullTextRetry(id);
     stats.skipped = skipped.size;
-
     refreshUi();
-    pump();
+    if (request) pump();
   }
 
   let scanTimer = null;
@@ -481,14 +594,68 @@
 
   function applyHudTheme() {
     if (!hud) return;
-    const dark = darkQuery.matches;
+    const dark = pageIsDark;
     hud.style.background = dark ? "rgba(17,24,28,.92)" : "rgba(232,237,239,.96)";
     hud.style.color = dark ? "#e6eff0" : "#2b3438";
     // 浅底面板压在白色页面上需要一点边界感；深底不需要。
     hud.style.boxShadow = dark ? "none" : "0 1px 3px rgba(0,0,0,.10)";
   }
 
-  darkQuery.addEventListener("change", applyHudTheme);
+  let pageIsDark = darkQuery.matches;
+  let tip = null, tipOwner = null;
+  function hideTip() {
+    tipOwner?.removeAttribute("aria-describedby");
+    tip?.remove(); tip = null; tipOwner = null;
+  }
+  function showTip(owner, text) {
+    hideTip();
+    tipOwner = owner;
+    tip = document.createElement("div");
+    tip.id = "xtags-label-details";
+    tip.setAttribute("data-xtags-tip", "");
+    tip.setAttribute("role", "tooltip");
+    tip.textContent = text;
+    tip.style.cssText = "position:fixed;z-index:2147483001;padding:10px;border-radius:6px;white-space:pre-wrap;" +
+      "font:13px/1.5 system-ui;max-width:min(320px,calc(100vw - 16px));box-sizing:border-box;" +
+      "pointer-events:none;box-shadow:0 2px 8px #0004;" +
+      `background:${pageIsDark ? "#202b33" : "#fff"};color:${pageIsDark ? "#f1f5f9" : "#17212a"};`;
+    positionTip();
+    owner.setAttribute("aria-describedby", tip.id);
+    document.body.appendChild(tip);
+  }
+  function positionTip() {
+    const rect = tipOwner.getBoundingClientRect();
+    tip.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 328))}px`;
+    tip.style.top = `${Math.max(8, Math.min(rect.bottom + 6, window.innerHeight - 160))}px`;
+  }
+  document.addEventListener("click", (event) => { if (!event.target.closest?.(`[${BADGE_ATTR}]`)) hideTip(); });
+  window.addEventListener("scroll", () => {
+    // Keyboard focus can itself scroll the page; keep its description available.
+    if (tipOwner?.isConnected && document.activeElement === tipOwner) positionTip();
+    else hideTip();
+  }, { passive: true });
+  function refreshTheme() {
+    let dark = darkQuery.matches;
+    for (const el of [document.body, document.documentElement]) {
+      const match = getComputedStyle(el).backgroundColor.match(/rgba?\(([^)]+)\)/);
+      if (!match) continue;
+      const values = match[1].split(",").map(Number);
+      if (values.length === 4 && values[3] < .9) continue;
+      dark = .2126 * values[0] + .7152 * values[1] + .0722 * values[2] < 128;
+      break;
+    }
+    if (dark !== pageIsDark) {
+      pageIsDark = dark;
+      for (const el of document.querySelectorAll("[data-xtags-level]")) {
+        const color = LEVELS[el.dataset.xtagsLevel] || LEVELS.calm;
+        el.style.background = dark ? color.darkBg : color.bg;
+        el.style.color = dark ? color.darkFg : color.fg;
+      }
+      hideTip();
+    }
+    applyHudTheme();
+  }
+  darkQuery.addEventListener("change", refreshTheme);
 
   function ensureHud() {
     if (hud && hud.isConnected) return hud;
@@ -579,9 +746,10 @@
     clearBadges();
     refreshUi();
     if (Object.keys(changes).every((key) => key === "language")) {
-      for (const id of cache.keys()) paint(id);
+      scan({ repaint: true, request: false });
     } else {
-      scan();
+      if (changes.retryToken) retryFailures(true);
+      else scan({ repaint: true });
     }
   }
 
@@ -600,7 +768,7 @@
   window.addEventListener("languagechange", () => {
     if (booted && i18n.preference === "auto") {
       clearBadges();
-      for (const id of cache.keys()) paint(id);
+      scan({ repaint: true, request: false });
       refreshUi();
     }
   });
@@ -608,14 +776,18 @@
   // 忽略自己的 HUD/标签变动，避免扫描 → 写 DOM → 扫描的反馈循环。
   function ownNode(node) {
     const el = node.nodeType === 1 ? node : node.parentElement;
-    return !!el?.closest(`[${BADGE_ATTR}], [data-xtags-hud]`);
+    return !!el?.closest(`[${BADGE_ATTR}], [data-xtags-hud], [data-xtags-tip]`);
   }
 
   function onMutations(records) {
     if (records.some((record) => {
       if (ownNode(record.target)) return false;
-      if (record.type !== "childList") return true;
-      return [...record.addedNodes, ...record.removedNodes].some((node) => !ownNode(node));
+      const target = record.target.nodeType === 1 ? record.target : record.target.parentElement;
+      if (record.type !== "childList") return !!target?.closest(POST_SELECTOR);
+      const external = [...record.addedNodes, ...record.removedNodes].filter((node) => !ownNode(node));
+      if (!external.length) return false;
+      if (target?.closest(POST_SELECTOR)) return true;
+      return external.some((node) => node.nodeType === 1 && (node.matches(POST_SELECTOR) || node.querySelector(POST_SELECTOR)));
     })) scheduleScan();
   }
 
@@ -623,7 +795,7 @@
   function loadPublicConfig() {
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage({ type: "xtags-config" }, (res) => {
-        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (chrome.runtime.lastError) return reject(Object.assign(new Error("Background unavailable"), { code: "errorNoResponse", retryable: true }));
         if (!res?.ok || !res.data) return reject(new Error(res?.error || "settings unavailable"));
         resolve(res.data);
       });
@@ -653,6 +825,9 @@
       attributes: true,
       attributeFilter: ["href", "data-testid"],
     });
+    const themeObserver = new MutationObserver(refreshTheme);
+    for (const el of [document.body, document.documentElement]) themeObserver.observe(el, { attributes: true, attributeFilter: ["style", "class"] });
+    refreshTheme();
     refreshUi();
     scan();
   }

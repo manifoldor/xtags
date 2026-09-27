@@ -10,7 +10,13 @@
     let request;
     try { request = JSON.parse(event.detail); } catch { return; }
     if (!/^\d{1,30}$/.test(request?.id) || !Number.isSafeInteger(request?.token)) return;
-    const ownTime = [...article.querySelectorAll('a[href*="/status/"]')].find((a) => a.querySelector("time"));
+    const ownTime = [...article.querySelectorAll('a[href*="/status/"]')].find((a) => {
+      if (!a.querySelector("time") || a.closest('article[data-testid="tweet"]') !== article) return false;
+      for (let parent = a.parentElement; parent && parent !== article; parent = parent.parentElement) {
+        if (parent.matches('[role="link"], [data-testid="quoteTweet"]')) return false;
+      }
+      return true;
+    });
     if (ownTime?.getAttribute("href")?.match(/status\/(\d+)/)?.[1] !== request.id) return;
 
     let fiber = article[Object.keys(article).find((key) => key.startsWith("__reactFiber$"))];

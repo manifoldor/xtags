@@ -11,7 +11,8 @@ if (!executable) throw new Error('请安装 Chrome/Chromium，或通过 CHROME_B
 const root = path.join(__dirname, '..');
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'xtags-regression-'));
 const original = fs.readFileSync(path.join(root, 'extension/content.js'), 'utf8');
-const source = original.replace('  boot().catch(', '  globalThis.audit = { scan, get cache() { return cache; }, get inflight() { return inflight; } };\n  globalThis.ready = boot().catch(');
+const source = original.replace('function extract(el) {', 'function extract(el) { globalThis.extractCount = (globalThis.extractCount || 0) + 1;')
+  .replace('  boot().catch(', '  globalThis.audit = { scan, cacheText, failed, get queue() { return queue; }, get cache() { return cache; }, get inflight() { return inflight; } };\n  globalThis.ready = boot().catch(');
 const translations = fs.readFileSync(path.join(root, 'extension/i18n.js'), 'utf8');
 const fullTextSource = fs.readFileSync(path.join(root, 'extension/fulltext.js'), 'utf8');
 const popupMarkup = fs.readFileSync(path.join(root, 'extension/popup.html'), 'utf8').replace(/<script[\s\S]*?<\/script>/g, '');

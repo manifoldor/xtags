@@ -1,8 +1,10 @@
 # GitHub Pages 发布隐私政策
 
+**0.1.9（2026-09-27）：** 本版中英文政策和支持页位于 `docs/`，随 `main` 分支推送由 GitHub Pages 发布。正式提交商城前，匿名打开下方地址，核对日期、正文和返回状态；不要根据旧版成功记录推断本版已部署。
+
 发布状态（2026-09-23）：**0.1.8 已上线并匿名验证。** 源码和资料提交 `b914422` 已推送至 `main`。GitHub Pages 发布来源为 **Deploy from a branch → main → /docs**，强制 HTTPS。公开中英文政策、主页、支持页和样式文件均返回 200，与本地 `docs/` 逐字节一致；随包 `extension/privacy/` 页面也与 `docs/` 一致。
 
-[0.1.5 首次部署](https://github.com/manifoldor/xtags/actions/runs/35491604540)已成功。下列地址于 2026-09-23 再次匿名验证，包含 0.1.8 版本日期和新的全文读取、key 访问范围说明。
+[0.1.5 首次部署](https://github.com/manifoldor/xtags/actions/runs/35491604540)已成功。下列地址曾于 2026-09-23 匿名验证，彼时为 0.1.8 内容；0.1.9 需再次核对。
 
 ## 已发布地址
 
@@ -13,7 +15,7 @@
 | 中文政策 | https://manifoldor.github.io/xtags/privacy.zh-CN.html |
 | Support URL | https://manifoldor.github.io/xtags/support.html |
 
-商城 Privacy policy 字段可填写上方英文政策地址。0.1.8 页面补充了折叠长文展开前发送全文、数据缓存和 key 访问范围的说明。
+商城 Privacy policy 字段填写上方英文政策地址。0.1.9 页面还说明有限失败恢复、响应字段净化和“暂停并清空缓存”的行为。
 
 ## 后续更新
 

@@ -18,8 +18,8 @@ test('auto uses Chinese for all Chinese regions and English otherwise', () => {
 
 test('manual locale takes priority; invalid stored preferences use auto', () => {
   const { XtagsI18n } = setup('zh-CN');
-  const language = XtagsI18n.create('en'); assert.equal(language.t('reset'), 'Clear cache');
-  language.setPreference('zh'); assert.equal(language.t('reset'), '清空缓存');
+  const language = XtagsI18n.create('en'); assert.equal(language.t('reset'), 'Pause and clear cache');
+  language.setPreference('zh'); assert.equal(language.t('reset'), '暂停并清空缓存');
   language.setPreference('unsupported'); assert.equal(language.preference, 'auto'); assert.equal(language.locale, 'zh');
   assert.equal(XtagsI18n.create().locale, 'zh');
 });
@@ -35,7 +35,10 @@ test('both catalogs cover the same keys and localize stored error codes', () => 
   for (const locale of ['en', 'zh']) {
     const language = XtagsI18n.create(locale);
     for (const key of Object.keys(catalogs.en)) assert.ok(language.t(key), `${locale}.${key}`);
-    assert.ok(language.error({ code: 'errorHttp', detail: '401 unauthorized' }).includes('401 unauthorized'));
+    const safe = language.error({ code: 'errorHttp', status: 401, detail: 'Bearer secret-key', message: 'secret-key' });
+    assert.ok(safe.includes('401'));
+    assert.ok(!safe.includes('secret-key'));
+    assert.ok(!language.error('Bearer secret-key').includes('secret-key'));
     assert.notEqual(language.error({ code: 'errorTimeout' }), 'errorTimeout');
     assert.ok(!language.t('errorHttp', { detail: '$& <text>' }).includes('{detail}'));
   }

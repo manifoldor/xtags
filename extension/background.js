@@ -57,17 +57,24 @@ const QUESTIONS = {
 // Increment in background, content and popup when data practices require renewed consent.
 const CONSENT_VERSION = 2;
 const DEFAULTS = { apiKey: "", keyRevision: "", model: "jev-latest", enabled: false, consentVersion: 0, apiEndpoint: ENDPOINT, consentEndpoint: ENDPOINT, resetToken: 0 };
-const PUBLIC_DEFAULTS = { threshold: 0.8, showAll: false, skipReplies: true, showHud: true, language: "auto" };
+const PUBLIC_DEFAULTS = { threshold: 0.8, showAll: false, skipReplies: true, showHud: true, language: "auto", retryToken: 0 };
 const PUBLIC_KEYS = ["keyRevision", "model", "enabled", "consentVersion", "apiEndpoint", "consentEndpoint", "resetToken",
   ...Object.keys(PUBLIC_DEFAULTS)];
 // Cached probabilities are tied to the exact classification questions.
 const CACHE_VERSION = 6;
 const CACHE_LIMIT = 3000;
+const CACHE_BYTE_LIMIT = 2 * 1024 * 1024;
+const RESPONSE_BYTE_LIMIT = 64 * 1024;
+const CACHE_PREFIX = "cacheEntry:";
+const storedCacheKeys = new Set();
+const cacheSizes = new Map();
+let cacheBytes = 0;
 const MAX_INFLIGHT = 3;
 const REQUEST_TIMEOUT = 20000;
 const MAX_ATTEMPTS = 3;
 const cache = new Map();
 const jobs = new Map();
+const consumers = new Map();
 const running = new Set();
 let queue = [];
 let generation = 0;
@@ -108,6 +115,85 @@ function validAnswers(a) {
     ["rage_bait", "synthetic", "undisclosed_ad"].every((k) => probability(a[k]?.noul));
 }
 
+// Rebuild untrusted answers instead of retaining provider-specific/debug fields.
+function cleanAnswers(value) {
+  if (!validAnswers(value)) return null;
+  const probabilities = {};
+  for (const key of Object.keys(QUESTIONS.intent.criteria)) {
+    const p = value.intent.probabilities[key];
+    if (typeof p === "number" && Number.isFinite(p) && p >= 0 && p <= 1) probabilities[key] = p;
+  }
+  return {
+    intent: { choice: value.intent.choice, confidence: value.intent.confidence, probabilities },
+    rage_bait: { noul: value.rage_bait.noul },
+    synthetic: { noul: value.synthetic.noul },
+    undisclosed_ad: { noul: value.undisclosed_ad.noul },
+  };
+}
+
+function clearCache() { cache.clear(); cacheSizes.clear(); cacheBytes = 0; }
+function remember(id, entry) {
+  cacheBytes -= cacheSizes.get(id) || 0;
+  cache.delete(id);
+  cache.set(id, entry);
+  const bytes = new TextEncoder().encode(JSON.stringify(entry)).byteLength + CACHE_PREFIX.length + id.length;
+  cacheSizes.set(id, bytes);
+  cacheBytes += bytes;
+  while (cache.size > CACHE_LIMIT || cacheBytes > CACHE_BYTE_LIMIT) {
+    const oldest = cache.keys().next().value;
+    cacheBytes -= cacheSizes.get(oldest);
+    cacheSizes.delete(oldest);
+    cache.delete(oldest);
+  }
+}
+
+const ERROR_TEXT = Object.freeze({
+  errorCancelled: "设置已变化，请求已取消", errorConsentRequired: "请先在设置页中同意数据传输",
+  errorNoKey: "还没有配置 API key", errorInvalidRequest: "帖子请求格式无效",
+  errorInvalidResponse: "API 返回的判断格式无效", errorResponseTooLarge: "API 响应超过大小限制",
+  errorInvalidEndpoint: "API 地址无效", errorEndpointPermission: "请在设置页授权当前 API 服务域名",
+  errorQueueFull: "请求队列已满，请稍后重试", errorHttp: "API 请求失败",
+  errorAuth: "API 认证或访问失败，请检查 key 和服务权限", errorRateLimit: "服务暂时限流，请稍后重试",
+  errorTimeout: "请求超时，请稍后重试", errorNetwork: "网络请求失败，请检查连接后重试",
+  errorRequest: "请求失败，请重试", errorCacheWrite: "缓存保存失败；刷新后可能重新请求",
+});
+function safeError(e) {
+  const code = Object.hasOwn(ERROR_TEXT, e?.code) ? e.code : "errorRequest";
+  const status = Number.isInteger(e?.status) && e.status >= 100 && e.status <= 599 ? e.status : undefined;
+  return { code, error: ERROR_TEXT[code], ...(status ? { status } : {}),
+    retryable: e?.retryable === true || ["errorNetwork", "errorTimeout", "errorQueueFull"].includes(code),
+    cancelled: code === "errorCancelled" };
+}
+async function health(kind, error) {
+  const cfg = settings;
+  if (!cfg) return;
+  const result = error ? safeError(error) : {};
+  try {
+    await chrome.storage.session.set({ serviceHealth: { kind, endpoint: cfg.apiEndpoint, keyRevision: cfg.keyRevision, resetToken: cfg.resetToken, at: Date.now(),
+      ...(error ? { code: result.code, status: result.status || 0, retryable: result.retryable } : {}) } });
+  } catch { /* Diagnostics must not block classification. */ }
+}
+
+async function readResponse(res) {
+  const declaredSize = Number(res.headers.get("Content-Length"));
+  const tooLarge = () => Object.assign(new Error(ERROR_TEXT.errorResponseTooLarge), { code: "errorResponseTooLarge", retryable: false });
+  if (declaredSize > RESPONSE_BYTE_LIMIT) { await res.body?.cancel(); throw tooLarge(); }
+  const reader = res.body?.getReader();
+  if (!reader) throw Object.assign(new Error(ERROR_TEXT.errorInvalidResponse), { code: "errorInvalidResponse", retryable: false });
+  let size = 0, text = "";
+  const decoder = new TextDecoder();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > RESPONSE_BYTE_LIMIT) { await reader.cancel(); throw tooLarge(); }
+      text += decoder.decode(value, { stream: true });
+    }
+    return JSON.parse(text + decoder.decode());
+  } finally { reader.releaseLock(); }
+}
+
 function current(job) {
   if (job.generation !== generation || job.controller.signal.aborted) throw cancelled();
 }
@@ -122,19 +208,23 @@ function invalidate() {
   queue = [];
 }
 
-// 单一写入者，串行落盘；重置后的空缓存总是在旧写入之后提交。
-function persistCache(cfg, epoch) {
+// One serialized writer; each success persists only its changed record. Resets
+// remove obsolete records before publishing new metadata, including on restart.
+function persistCache(cfg, epoch, ids = []) {
   const write = writes.then(async () => {
     if (epoch !== generation) return;
-    await chrome.storage.local.set({
-      cacheVersion: CACHE_VERSION,
-      cacheModel: cfg.model,
-      cacheEndpoint: cfg.apiEndpoint,
-      cacheResetToken: cfg.resetToken,
-      cache: Object.fromEntries(cache),
-    });
+    const obsolete = [...storedCacheKeys].filter((key) => !cache.has(key.slice(CACHE_PREFIX.length)));
+    if (obsolete.length) {
+      await chrome.storage.local.remove(obsolete);
+      for (const key of obsolete) storedCacheKeys.delete(key);
+    }
+    const updates = { cacheVersion: CACHE_VERSION, cacheModel: cfg.model,
+      cacheEndpoint: cfg.apiEndpoint, cacheResetToken: cfg.resetToken };
+    for (const id of ids) if (cache.has(id)) updates[CACHE_PREFIX + id] = cache.get(id);
+    await chrome.storage.local.set(updates);
+    for (const key of Object.keys(updates)) if (key.startsWith(CACHE_PREFIX)) storedCacheKeys.add(key);
   });
-  writes = write.catch((e) => console.warn("[xtags] 缓存保存失败:", e.message));
+  writes = write.catch(() => console.warn("[xtags] 缓存保存失败"));
   return write;
 }
 
@@ -148,7 +238,13 @@ function config() {
     cfg.resetToken = cfg.resetToken ?? 0;
     if (settings && Object.keys(DEFAULTS).some((k) => settings[k] !== cfg[k])) {
       invalidate();
-      if (settings.model !== cfg.model || settings.resetToken !== cfg.resetToken || settings.apiEndpoint !== cfg.apiEndpoint) cache.clear();
+      if (settings.model !== cfg.model || settings.resetToken !== cfg.resetToken || settings.apiEndpoint !== cfg.apiEndpoint) clearCache();
+    }
+    if (settings && settings.skipReplies !== cfg.skipReplies && cfg.skipReplies) {
+      for (const job of jobs.values()) if (job.isReply) {
+        job.controller.abort(); job.reject(cancelled()); jobs.delete(job.key);
+      }
+      queue = queue.filter((job) => !job.controller.signal.aborted);
     }
     settings = cfg;
     await publishPublicConfig(cfg);
@@ -161,15 +257,27 @@ function config() {
 const ready = (async () => {
   const epoch = generation;
   const cfg = await config();
-  const stored = await chrome.storage.local.get(["cacheVersion", "cacheModel", "cacheEndpoint", "cacheResetToken", "cache"]);
+  const stored = await chrome.storage.local.get(null);
+  for (const key of Object.keys(stored)) if (key.startsWith(CACHE_PREFIX)) storedCacheKeys.add(key);
   if (epoch !== generation) return;
+  const repaired = [];
   if ((stored.cacheEndpoint ?? ENDPOINT) === cfg.apiEndpoint && stored.cacheVersion === CACHE_VERSION && stored.cacheModel === cfg.model &&
       stored.cacheResetToken === cfg.resetToken) {
-    for (const [id, entry] of Object.entries(stored.cache ?? {}).slice(-CACHE_LIMIT)) {
-      if (/^\d+$/.test(id) && /^[a-f0-9]{64}$/.test(entry?.fingerprint) &&
-          validAnswers(entry?.answers) && Number.isFinite(entry.at)) cache.set(id, entry);
+    const entries = new Map(Object.entries(stored.cache ?? {}));
+    for (const key of storedCacheKeys) entries.set(key.slice(CACHE_PREFIX.length), stored[key]);
+    for (const [id, entry] of [...entries].sort((a, b) => (a[1]?.at || 0) - (b[1]?.at || 0))) {
+      const answers = cleanAnswers(entry?.answers);
+      if (!/^\d{1,30}$/.test(id) || !/^[a-f0-9]{64}$/.test(entry?.fingerprint) || !answers || !Number.isFinite(entry.at)) continue;
+      const clean = { answers, fingerprint: entry.fingerprint, at: entry.at };
+      remember(id, clean);
+      if (!storedCacheKeys.has(CACHE_PREFIX + id) || JSON.stringify(clean) !== JSON.stringify(entry)) repaired.push(id);
     }
   }
+  // Migrate legacy cache once, stripping extra data before exposing any result.
+  try {
+    if (stored.cache !== undefined) await chrome.storage.local.remove("cache");
+    await persistCache(cfg, epoch, repaired);
+  } catch { console.warn("[xtags] 缓存迁移失败"); }
 })();
 
 const ICONS = Object.fromEntries(["on", "off"].map((state) => [state,
@@ -178,14 +286,14 @@ const ICONS = Object.fromEntries(["on", "off"].map((state) => [state,
 async function syncIcon() {
   try {
     const cfg = await config();
-    await chrome.action.setIcon({ path: cfg.enabled === true && XtagsService.hasConsent(cfg, CONSENT_VERSION) ? ICONS.on : ICONS.off });
+    await chrome.action.setIcon({ path: cfg.enabled === true && !!cfg.apiKey && XtagsService.hasConsent(cfg, CONSENT_VERSION) ? ICONS.on : ICONS.off });
   } catch (e) { console.warn("[xtags] 图标切换失败:", e.message); }
 }
 chrome.runtime.onInstalled.addListener(syncIcon);
 chrome.runtime.onStartup.addListener(syncIcon);
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== "local") return;
-  if (changes.enabled || changes.consentVersion || changes.apiEndpoint || changes.consentEndpoint) syncIcon();
+  if (changes.apiKey || changes.enabled || changes.consentVersion || changes.apiEndpoint || changes.consentEndpoint) syncIcon();
   const cacheInputsChanged = ["enabled", "consentVersion", "apiEndpoint", "consentEndpoint", "apiKey", "keyRevision", "model", "resetToken"].some((k) => changes[k]);
   if (!cacheInputsChanged && !PUBLIC_KEYS.some((k) => changes[k])) return;
   // 即使没有后续请求，也要保存重置和缓存的配置标记。
@@ -226,7 +334,7 @@ async function request(job) {
     await ensureAccess(cfg);
     cfg = await config();
     current(job);
-    if (cfg.enabled !== true || !XtagsService.hasConsent(cfg, CONSENT_VERSION) || !cfg.apiKey || cfg.resetToken !== job.cfg.resetToken || cfg.model !== job.cfg.model) {
+    if (cfg.enabled !== true || (cfg.skipReplies && job.isReply) || !XtagsService.hasConsent(cfg, CONSENT_VERSION) || !cfg.apiKey || cfg.resetToken !== job.cfg.resetToken || cfg.model !== job.cfg.model) {
       throw cancelled();
     }
     const controller = new AbortController();
@@ -246,26 +354,28 @@ async function request(job) {
       });
       current(job);
       if (!res.ok) {
-        const body = await res.text();
+        await res.body?.cancel();
         const seconds = Number(res.headers.get("Retry-After"));
         if (Number.isFinite(seconds) && seconds > 0) retryAfter = Math.min(seconds * 1000, 20000);
-        throw Object.assign(new Error(`${res.status} ${body.slice(0, 200)}`), {
+        throw Object.assign(new Error(`HTTP ${res.status}`), {
           retryable: res.status === 429 || res.status >= 500,
-          code: "errorHttp",
+          code: [401, 403].includes(res.status) ? "errorAuth" : res.status === 429 ? "errorRateLimit" : "errorHttp",
+          status: res.status,
         });
       }
-      const data = await res.json();
+      const data = await readResponse(res);
       current(job);
-      if (!validAnswers(data.answers)) {
+      const answers = cleanAnswers(data?.answers);
+      if (!answers) {
         throw Object.assign(new Error("API 返回的判断格式无效"), { retryable: false, code: "errorInvalidResponse" });
       }
       const tokens = data.usage?.input_tokens;
-      return { answers: data.answers, usage: { input_tokens: Number.isFinite(tokens) && tokens >= 0 ? tokens : 0 } };
+      return { answers, usage: { input_tokens: Number.isFinite(tokens) && tokens >= 0 ? tokens : 0 } };
     } catch (e) {
       current(job);
-      if (e.retryable === false || attempt === MAX_ATTEMPTS - 1) {
+      if (e.retryable === false || e instanceof SyntaxError || attempt === MAX_ATTEMPTS - 1) {
         if (typeof e.code === "string") throw e;
-        throw Object.assign(new Error(e.message), {
+        throw Object.assign(new Error("API request failed"), {
           code: controller.signal.aborted ? "errorTimeout" : e instanceof SyntaxError ? "errorInvalidResponse" : "errorNetwork",
         });
       }
@@ -288,15 +398,18 @@ function pump() {
         await ensureAccess(await config());
         await config();
         current(job);
-        cache.delete(job.id);
-        cache.set(job.id, { answers: data.answers, fingerprint: job.fingerprint, at: Date.now() });
-        while (cache.size > CACHE_LIMIT) cache.delete(cache.keys().next().value);
+        remember(job.id, { answers: data.answers, fingerprint: job.fingerprint, at: Date.now() });
         let warning = "";
-        try { await persistCache(job.cfg, job.generation); }
+        try { await persistCache(job.cfg, job.generation, [job.id]); }
         catch { warning = "缓存保存失败；刷新后可能重新请求"; }
         current(job);
+        await health(warning ? "error" : "ok", warning ? { code: "errorCacheWrite" } : null);
+        current(job);
         job.resolve({ ...data, warning, warningCode: warning ? "errorCacheWrite" : "" });
-      } catch (e) { job.reject(e); }
+      } catch (e) {
+        if (!e.cancelled && job.generation === generation) await health("error", e);
+        job.reject(e);
+      }
       finally {
         running.delete(job);
         if (jobs.get(job.key) === job) jobs.delete(job.key);
@@ -306,7 +419,30 @@ function pump() {
   }
 }
 
-async function ask(msg) {
+function attachConsumer(job, consumer) {
+  if (!consumer) { job.legacyCaller = true; return; }
+  if (consumer.cancelled) throw cancelled();
+  consumer.job = job;
+  job.consumers.add(consumer);
+}
+function cancelConsumer(consumer) {
+  if (!consumer) return;
+  consumer.cancelled = true;
+  consumer.reject(cancelled());
+  const job = consumer.job;
+  if (!job) return;
+  job.consumers.delete(consumer);
+  if (job.consumers.size || job.legacyCaller) return;
+  job.controller.abort();
+  job.reject(cancelled());
+  if (jobs.get(job.key) === job) jobs.delete(job.key);
+  queue = queue.filter((entry) => entry !== job);
+}
+function consumerKey(sender, requestId) {
+  return `${sender.tab?.id ?? "none"}:${sender.documentId ?? sender.frameId ?? "none"}:${requestId}`;
+}
+
+async function ask(msg, consumer) {
   await ready;
   const cfg = await config();
   const epoch = generation;
@@ -314,6 +450,7 @@ async function ask(msg) {
   if (!XtagsService.hasConsent(cfg, CONSENT_VERSION)) throw Object.assign(new Error("请先在设置页中同意数据传输"), { code: "errorConsentRequired" });
   if (XtagsService.endpoint(msg) !== endpoint || cfg.enabled !== true || msg.resetToken !== cfg.resetToken || msg.model !== cfg.model) throw cancelled();
   if (!cfg.apiKey) throw Object.assign(new Error("还没有配置 API key"), { code: "errorNoKey" });
+  if (cfg.skipReplies && msg.isReply === true) throw cancelled();
   const post = msg.state?.post;
   if (typeof msg.id !== "string" || !/^\d{1,30}$/.test(msg.id) ||
       typeof post?.text !== "string" || !post.text.trim() || post.text.length > 100000 ||
@@ -321,17 +458,20 @@ async function ask(msg) {
     throw Object.assign(new Error("帖子请求格式无效"), { code: "errorInvalidRequest" });
   }
   const inputFingerprint = await fingerprint(post);
-  if (epoch !== generation) throw cancelled();
+  if (epoch !== generation || consumer?.cancelled) throw cancelled();
   const key = `${msg.id}:${inputFingerprint}`;
   if (cache.get(msg.id)?.fingerprint === inputFingerprint) return { answers: cache.get(msg.id).answers, cached: true, usage: { input_tokens: 0 } };
   if (jobs.has(key)) {
-    const data = await jobs.get(key).promise;
+    const shared = jobs.get(key);
+    attachConsumer(shared, consumer);
+    const data = await shared.promise;
     return { ...data, shared: true, usage: { input_tokens: 0 } };
   }
   if (jobs.size >= 300) throw Object.assign(new Error("请求队列已满，请稍后刷新页面"), { code: "errorQueueFull" });
-  const job = { id: msg.id, key, fingerprint: inputFingerprint,
+  const job = { id: msg.id, key, consumers: new Set(), isReply: msg.isReply === true, fingerprint: inputFingerprint,
     state: { post: { text: post.text, author: post.author } }, cfg, generation: epoch, controller: new AbortController() };
   job.promise = new Promise((resolve, reject) => { job.resolve = resolve; job.reject = reject; });
+  attachConsumer(job, consumer);
   jobs.set(key, job);
   queue.push(job);
   pump();
@@ -339,7 +479,20 @@ async function ask(msg) {
 }
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg?.type !== "jev-ask" && msg?.type !== "xtags-config") return;
+  if (msg?.type === "xtags-clear-cache") {
+    if (sender.id !== chrome.runtime.id || sender.url !== `chrome-extension://${chrome.runtime.id}/settings.html`) {
+      sendResponse({ ok: false, ...safeError({ code: "errorRequest" }) }); return;
+    }
+    (async () => {
+      await ready;
+      await chrome.storage.local.set({ enabled: false, resetToken: crypto.randomUUID() });
+      const cfg = await config();
+      await persistCache(cfg, generation);
+      return { ok: true };
+    })().then(sendResponse, () => sendResponse({ ok: false, ...safeError({ code: "errorCacheWrite" }) }));
+    return true;
+  }
+  if (!["jev-ask", "jev-cancel", "xtags-config"].includes(msg?.type)) return;
   if (sender.id !== chrome.runtime.id || !/^https:\/\/(x|twitter)\.com\//.test(sender.url ?? "")) {
     sendResponse({ ok: false, error: "不支持的消息来源", code: "errorSource" });
     return;
@@ -351,9 +504,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     );
     return true;
   }
-  ask(msg).then(
+  const tracked = typeof msg.requestId === "string" && /^[A-Za-z0-9-]{1,64}$/.test(msg.requestId);
+  const key = tracked ? consumerKey(sender, msg.requestId) : null;
+  if (msg.type === "jev-cancel") {
+    if (key) cancelConsumer(consumers.get(key));
+    sendResponse({ ok: true }); return;
+  }
+  if ((msg.requestId !== undefined && !tracked) || (key && consumers.has(key)) || consumers.size >= 600) {
+    sendResponse({ ok: false, ...safeError({ code: consumers.size >= 600 ? "errorQueueFull" : "errorInvalidRequest" }) }); return;
+  }
+  let consumer;
+  if (key) {
+    consumer = { cancelled: false, job: null };
+    consumer.promise = new Promise((_, reject) => { consumer.reject = reject; });
+    consumers.set(key, consumer);
+  }
+  const request = ask(msg, consumer);
+  (consumer ? Promise.race([request, consumer.promise]) : request).then(
     (data) => sendResponse({ ok: true, data }),
-    (e) => sendResponse({ ok: false, error: e.message, code: e.code || "errorRequest", cancelled: !!e.cancelled }),
-  );
+    (e) => sendResponse({ ok: false, ...safeError(e) }),
+  ).finally(() => { if (key && consumers.get(key) === consumer) consumers.delete(key); });
   return true;
 });

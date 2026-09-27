@@ -7,6 +7,7 @@ const path = require('node:path');
 const serviceSource = fs.readFileSync(path.join(__dirname, '../extension/service.js'), 'utf8');
 const source = fs.readFileSync(path.join(__dirname, '../extension/background.js'), 'utf8');
 const flush = async () => { for (let i = 0; i < 5; i++) { await new Promise(resolve => setImmediate(resolve)); for (let j = 0; j < 80; j++) await Promise.resolve(); } };
+const cacheEntries = data => Object.fromEntries(Object.entries(data).filter(([key]) => key.startsWith("cacheEntry:")).map(([key, value]) => [key.slice(11), value]));
 const answers = (choice = 'inform') => ({
   intent: { choice, confidence: .9, probabilities: { [choice]: .9 } },
   rage_bait: { noul: .7 }, synthetic: { noul: .1 }, undisclosed_ad: { noul: .1 },
@@ -19,10 +20,17 @@ async function setup(options = {}) {
   let serial = 0, message, active = 0, maxActive = 0, failWrites = false;
   const storage = {
     setAccessLevel: async ({ accessLevel }) => { accessLevels.local = accessLevel; },
-    get: async (keys) => Object.fromEntries((Array.isArray(keys) ? keys : Object.keys(keys))
-      .map(k => [k, structuredClone(k in data ? data[k] : Array.isArray(keys) ? undefined : keys[k])])),
+    get: async (keys) => Object.fromEntries((Array.isArray(keys) ? keys : Object.keys(keys ?? data))
+      .map(k => [k, structuredClone(k in data ? data[k] : Array.isArray(keys) || keys === null ? undefined : keys[k])])),
+    remove: async keys => {
+      if (failWrites) throw new Error("QUOTA_BYTES");
+      const changes = {};
+      for (const key of Array.isArray(keys) ? keys : [keys]) if (key in data) { changes[key] = { oldValue: data[key] }; delete data[key]; }
+      for (const fn of listeners) fn(changes, "local");
+    },
     set: async (obj) => {
-      if (failWrites && 'cache' in obj) throw new Error('QUOTA_BYTES');
+      options.onWrite?.(obj);
+      if (failWrites && Object.keys(obj).some(key => key.startsWith('cache'))) throw new Error('QUOTA_BYTES');
       const changes = {};
       for (const [key, value] of Object.entries(obj)) {
         if (JSON.stringify(data[key]) === JSON.stringify(value)) continue;
@@ -37,7 +45,7 @@ async function setup(options = {}) {
     set: async (values) => { Object.assign(sessionData, structuredClone(values)); },
   };
   const context = vm.createContext({
-    console: { warn() {} }, AbortController, URL, TextEncoder, crypto: webcrypto, importScripts() {},
+    console: { warn() {} }, AbortController, URL, TextEncoder, TextDecoder, crypto: webcrypto, importScripts() {},
     setTimeout(fn, ms) { timers.set(++serial, { fn, ms }); return serial; },
     clearTimeout(id) { timers.delete(id); },
     chrome: {
@@ -50,8 +58,8 @@ async function setup(options = {}) {
       active++; maxActive = Math.max(active, maxActive); let done = false;
       const finish = fn => value => { if (done) return; done = true; active--; fn(value); };
       const ok = finish(resolve), fail = finish(reject);
-      calls.push({ url, init, respond(body = { answers: answers(), usage: { input_tokens: 100 } }, status = 200, retryAfter = null) {
-        ok({ ok: status >= 200 && status < 300, status, headers: { get: () => retryAfter }, json: async () => structuredClone(body), text: async () => JSON.stringify(body) });
+      calls.push({ url, init, raw: ok, respond(body = { answers: answers(), usage: { input_tokens: 100 } }, status = 200, retryAfter = null) {
+        ok(new Response(JSON.stringify(body), { status, headers: retryAfter ? { 'Retry-After': retryAfter } : {} }));
       }, fail });
       if (!options.ignoreAbort) init.signal.addEventListener('abort', () => fail(new DOMException('Aborted', 'AbortError')), { once: true });
     }),
@@ -66,6 +74,14 @@ async function setup(options = {}) {
       return new Promise(resolve => message({ type: 'jev-ask', id, apiEndpoint: data.apiEndpoint, model: data.model ?? 'jev-latest', resetToken: data.resetToken ?? 0,
         state: { post: { author: '@alice', text: `Post ${id}` } }, ...extra },
       { id: 'xtags-test', url: 'https://x.com/home', ...sender }, resolve));
+    },
+    clearCache(sender = {}) {
+      return new Promise(resolve => message({ type: 'xtags-clear-cache' },
+        { id: 'xtags-test', url: 'chrome-extension://xtags-test/settings.html', ...sender }, resolve));
+    },
+    cancel(requestId, sender = {}) {
+      return new Promise(resolve => message({ type: 'jev-cancel', requestId },
+        { id: 'xtags-test', url: 'https://x.com/home', ...sender }, resolve));
     },
     configMessage(sender = {}) {
       return new Promise(resolve => message({ type: 'xtags-config' },
@@ -118,7 +134,7 @@ test('same post in two tabs shares one request and cache survives worker restart
   e.calls[0].respond(); const [ra, rb] = await Promise.all([a, b]);
   assert.equal(ra.data.usage.input_tokens + rb.data.usage.input_tokens, 100);
   const c = e.ask('2'); await flush(); e.calls[1].respond(); await c;
-  assert.deepEqual(Object.keys(e.data.cache), ['1', '2']);
+  assert.deepEqual(Object.keys(cacheEntries(e.data)), ['1', '2']);
   const next = await setup({ data: e.data }); assert.equal((await next.ask('1')).data.cached, true);
   assert.equal((await next.ask('2')).data.cached, true); assert.equal(next.calls.length, 0);
 });
@@ -133,8 +149,8 @@ test('same post ID with a longer body is classified again and replaces the previ
   assert.equal(JSON.parse(e.calls[1].init.body).state.post.text, fullText);
   e.calls[1].respond({ answers: answers('sell') });
   assert.equal((await full).data.answers.intent.choice, 'sell');
-  assert.match(e.data.cache['1'].fingerprint, /^[a-f0-9]{64}$/);
-  assert.equal(JSON.stringify(e.data.cache).includes(fullText), false);
+  assert.match(cacheEntries(e.data)['1'].fingerprint, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(cacheEntries(e.data)).includes(fullText), false);
   const restarted = await setup({ data: e.data });
   assert.equal((await restarted.ask('1', { state: { post: { author: '@alice', text: fullText } } })).data.cached, true);
   const oldBody = restarted.ask('1', { state: { post: { author: '@alice', text: 'Beginning' } } });
@@ -157,7 +173,7 @@ test('reset isolates late responses and old content-script tokens', async () => 
   assert.equal((await e.ask('1', { resetToken: 0 })).cancelled, true);
   const current = e.ask('1'); await flush(); e.calls[1].respond({ answers: answers('sell') }); await current;
   e.calls[0].respond({ answers: answers('inform') }); await flush();
-  assert.equal(e.data.cache['1'].answers.intent.choice, 'sell');
+  assert.equal(cacheEntries(e.data)['1'].answers.intent.choice, 'sell');
   const next = await setup({ data: e.data }); assert.equal((await next.ask('1')).data.answers.intent.choice, 'sell');
 });
 
@@ -189,7 +205,7 @@ test('timeouts have bounded retries and release the job for later attempts', asy
 
 test('invalid answers are not cached or retried', async () => {
   const e = await setup(); const result = e.ask('1'); await flush(); e.calls[0].respond({ answers: { intent: {} } });
-  assert.match((await result).error, /格式无效/); assert.equal(e.calls.length, 1); assert.equal(e.data.cache?.['1'], undefined);
+  assert.match((await result).error, /格式无效/); assert.equal(e.calls.length, 1); assert.equal(cacheEntries(e.data)?.['1'], undefined);
 });
 
 test('cache write failure returns a usable result with a visible warning', async () => {
@@ -228,7 +244,7 @@ test('settings reread blocks late results even before storage notification', asy
   const e = await setup(); const first = e.ask('1'); await flush();
   e.data.enabled = false;
   e.calls[0].respond(); assert.equal((await first).cancelled, true);
-  assert.equal(e.data.cache?.['1'], undefined);
+  assert.equal(cacheEntries(e.data)?.['1'], undefined);
 });
 
 test('language changes preserve active requests and cached probabilities', async () => {
@@ -267,7 +283,7 @@ test('withdrawal alone aborts active work, discards queued and late results; re-
   assert.ok((await Promise.all(pending)).every(r => r.cancelled));
   assert.ok(e.calls.every(c => c.init.signal.aborted));
   for (const call of e.calls) call.respond(); await flush();
-  assert.equal(e.calls.length, 3); assert.deepEqual(e.data.cache, {});
+  assert.equal(e.calls.length, 3); assert.deepEqual(cacheEntries(e.data), {});
   assert.equal((await e.ask('5')).code, 'errorConsentRequired');
   await e.set({ consentVersion: 2, enabled: true });
   const resumed = e.ask('1'); await flush(); e.calls[3].respond();
@@ -283,7 +299,7 @@ test('consent reread blocks retries and result writes before onChanged is delive
   await e.set({ consentVersion: 2 });
   const late = e.ask('2'); await flush();
   e.data.consentVersion = 0; e.calls[1].respond();
-  assert.equal((await late).cancelled, true); assert.equal(e.data.cache?.['2'], undefined);
+  assert.equal((await late).cancelled, true); assert.equal(cacheEntries(e.data)?.['2'], undefined);
 });
 
 test('consent versions remain aligned across extension contexts', () => {
@@ -319,7 +335,7 @@ test('destination changes invalidate consent, caches, queued work and stale cont
   assert.equal((await e.ask('1', { apiEndpoint: 'https://api.typesafe.ai/v1/systemone' })).cancelled, true);
   const custom = e.ask('1'); await flush(); assert.equal(e.calls.length, 3);
   e.calls[1].respond({ answers: answers('sell') }); e.calls[2].respond(); await custom;
-  assert.equal(e.data.cache['2'], undefined); assert.equal(e.data.cacheEndpoint, apiEndpoint);
+  assert.equal(cacheEntries(e.data)['2'], undefined); assert.equal(e.data.cacheEndpoint, apiEndpoint);
 });
 
 test('custom service cannot reuse unmarked official cache or bypass revoked host permission', async () => {
@@ -334,4 +350,170 @@ test('custom service cannot reuse unmarked official cache or bypass revoked host
   assert.equal((await pending).cancelled, true); assert.ok(e.calls[0].init.signal.aborted);
   e.calls[0].respond(); await flush();
   assert.equal((await e.ask('1')).code, 'errorEndpointPermission'); assert.equal(e.calls.length, 1);
+});
+
+test('provider extras are stripped before returning, caching and legacy migration', async () => {
+  const e = await setup();
+  const dirty = answers();
+  dirty.debug = { authorization: 'secret-echo', text: 'entire post' };
+  dirty.intent.prompt = 'secret-echo'; dirty.intent.probabilities.extra = .9;
+  dirty.rage_bait.explanation = 'secret-echo';
+  const pending = e.ask('1'); await flush();
+  e.calls[0].respond({ answers: dirty, debug: 'secret-echo', usage: { input_tokens: 7, key: 'secret-echo' } });
+  const result = await pending;
+  assert.equal(JSON.stringify(result).includes('secret-echo'), false);
+  assert.deepEqual(structuredClone(result.data.answers), answers());
+  const entry = cacheEntries(e.data)['1'];
+  assert.deepEqual(entry.answers, answers());
+  const legacy = { ...e.data, cache: { '1': { ...entry, answers: dirty, debug: 'secret-echo' } } };
+  delete legacy['cacheEntry:1'];
+  const migrated = await setup({ data: legacy });
+  assert.equal((await migrated.ask('1')).data.cached, true);
+  assert.equal(JSON.stringify(migrated.data).includes('secret-echo'), false);
+  assert.equal(Object.hasOwn(migrated.data, 'cache'), false);
+});
+
+test('HTTP error body is cancelled unread and never leaks into response or health', async () => {
+  const e = await setup(); const pending = e.ask('1'); await flush();
+  let cancelled = false;
+  e.calls[0].raw({ ok: false, status: 401, headers: new Headers(), body: {
+    cancel: async () => { cancelled = true; },
+    getReader: () => { throw new Error('must not read Bearer test-key'); },
+  }, text: () => { throw new Error('must not read Bearer test-key'); } });
+  const result = await pending;
+  assert.equal(cancelled, true); assert.equal(result.code, 'errorAuth');
+  assert.equal(result.status, 401); assert.equal(result.retryable, false);
+  assert.equal(e.calls.length, 1);
+  assert.equal(JSON.stringify([result, e.sessionData]).includes('test-key'), false);
+  assert.equal(e.sessionData.serviceHealth.code, 'errorAuth');
+});
+
+test('network exception messages are never copied to content or diagnostics', async () => {
+  const e = await setup(); const pending = e.ask('1'); await flush();
+  for (let i = 0; i < 3; i++) {
+    e.calls[i].fail(new Error('Bearer test-key provider debugging'));
+    await flush(); if (i < 2) await e.tick(1000 * 2 ** i);
+  }
+  const result = await pending;
+  assert.equal(result.code, 'errorNetwork'); assert.equal(result.retryable, true);
+  assert.equal(JSON.stringify([result, e.sessionData]).includes('test-key'), false);
+});
+
+test('successful responses have a 64 KiB byte limit including streamed bodies', async () => {
+  for (const declared of [false, true]) {
+    const e = await setup(); const pending = e.ask('1'); await flush();
+    let cancelled = false, reads = 0;
+    const stream = new ReadableStream({
+      pull(controller) { reads++; controller.enqueue(new Uint8Array(20000)); },
+      cancel() { cancelled = true; },
+    });
+    e.calls[0].raw(new Response(stream, { headers: declared ? { 'Content-Length': '1000000' } : {} }));
+    const result = await pending;
+    assert.equal(result.code, 'errorResponseTooLarge'); assert.equal(result.retryable, false);
+    assert.equal(cancelled, true); assert.ok(reads <= 5);
+    assert.equal(e.calls.length, 1); assert.equal(Object.keys(cacheEntries(e.data)).length, 0);
+  }
+});
+
+test('malformed JSON is not retried and does not echo the payload', async () => {
+  const e = await setup(); const pending = e.ask('1'); await flush();
+  e.calls[0].raw(new Response('Bearer test-key invalid JSON'));
+  const result = await pending;
+  assert.equal(result.code, 'errorInvalidResponse'); assert.equal(result.retryable, false);
+  assert.equal(JSON.stringify(result).includes('test-key'), false); assert.equal(e.calls.length, 1);
+});
+
+test('one hundred successful posts persist one hundred records, not 5050', async () => {
+  let recordWrites = 0;
+  const e = await setup({ onWrite: obj => {
+    assert.equal(Object.hasOwn(obj, 'cache'), false);
+    recordWrites += Object.keys(obj).filter(k => k.startsWith('cacheEntry:')).length;
+  } });
+  for (let i = 1; i <= 100; i++) {
+    const pending = e.ask(String(i)); await flush(); e.calls[i - 1].respond(); await pending;
+  }
+  assert.equal(recordWrites, 100); assert.equal(Object.keys(cacheEntries(e.data)).length, 100);
+  const restarted = await setup({ data: e.data });
+  assert.equal((await restarted.ask('100')).data.cached, true); assert.equal(restarted.calls.length, 0);
+});
+
+test('reply setting cancels queued and running replies without cancelling normal posts', async () => {
+  const e = await setup(); await e.set({ skipReplies: false });
+  const running = e.ask('1', { isReply: true }), normal = [e.ask('2'), e.ask('3')], queued = e.ask('4', { isReply: true });
+  await flush(); assert.equal(e.calls.length, 3);
+  await e.set({ skipReplies: true });
+  assert.equal((await running).cancelled, true); assert.equal((await queued).cancelled, true);
+  assert.equal(e.calls[0].init.signal.aborted, true);
+  e.calls[1].respond(); e.calls[2].respond(); assert.ok((await Promise.all(normal)).every(r => r.ok));
+  assert.equal(e.calls.length, 3); assert.equal((await e.ask('5', { isReply: true })).cancelled, true);
+});
+
+test('trusted cache reset pauses, aborts and durably clears while preserving the key', async () => {
+  const e = await setup({ ignoreAbort: true });
+  const done = e.ask('1'); await flush(); e.calls[0].respond(); await done;
+  const late = e.ask('2'); await flush();
+  assert.equal((await e.clearCache({ url: 'https://x.com/home' })).ok, false);
+  assert.equal(e.data.enabled, true);
+  assert.equal((await e.clearCache()).ok, true);
+  assert.equal(e.data.enabled, false); assert.equal(e.data.apiKey, 'test-key');
+  assert.equal((await late).cancelled, true);
+  e.calls[1].respond(); await flush();
+  assert.equal(Object.keys(cacheEntries(e.data)).length, 0);
+  assert.equal(e.data.cacheResetToken, e.data.resetToken);
+  const restarted = await setup({ data: e.data });
+  assert.equal((await restarted.ask('1')).cancelled, true); assert.equal(restarted.calls.length, 0);
+});
+
+test('failed cache reset is reported and cannot resume uploading', async () => {
+  const e = await setup(); const pending = e.ask('1'); await flush(); e.calls[0].respond(); await pending;
+  e.failWrites = true;
+  const result = await e.clearCache();
+  assert.equal(result.ok, false); assert.equal(result.code, 'errorCacheWrite');
+  assert.equal(e.data.enabled, false); assert.equal((await e.ask('2')).cancelled, true);
+  e.failWrites = false; assert.equal((await e.clearCache()).ok, true);
+  assert.equal(Object.keys(cacheEntries(e.data)).length, 0);
+});
+
+test('cancel removes a background-queued consumer before any upload', async () => {
+  const e = await setup();
+  const active = ['1','2','3'].map(id => e.ask(id));
+  const queued = e.ask('4', {requestId:'queued'}); await flush();
+  assert.equal(e.calls.length, 3);
+  await e.cancel('queued'); assert.equal((await queued).cancelled, true);
+  e.calls.forEach(call => call.respond()); await Promise.all(active); await flush();
+  assert.equal(e.calls.length, 3);
+});
+
+test('cancellation is scoped to document and does not abort other shared consumers', async () => {
+  const e = await setup();
+  const a = {tab:{id:1},documentId:'a'}, b = {tab:{id:2},documentId:'b'};
+  const first = e.ask('1',{requestId:'same-id'},a), second = e.ask('1',{requestId:'same-id'},b); await flush();
+  assert.equal(e.calls.length, 1);
+  await e.cancel('same-id',{tab:{id:1},documentId:'different-document'});
+  assert.equal(e.calls[0].init.signal.aborted, false);
+  await e.cancel('same-id',a); assert.equal((await first).cancelled, true);
+  assert.equal(e.calls[0].init.signal.aborted, false);
+  e.calls[0].respond(); assert.equal((await second).ok, true);
+});
+
+test('last consumer cancellation aborts and immediate cancellation wins the hashing race', async () => {
+  const e = await setup();
+  const pending = e.ask('1',{requestId:'active'}); await flush();
+  await e.cancel('active'); assert.equal((await pending).cancelled, true);
+  assert.equal(e.calls[0].init.signal.aborted, true);
+  const early = e.ask('2',{requestId:'early'}); await e.cancel('early');
+  assert.equal((await early).cancelled, true); await flush();
+  assert.equal(e.calls.length, 1); assert.equal(Object.keys(cacheEntries(e.data)).length, 0);
+});
+
+test('startup prunes cache count and byte budget and keeps newest valid records', async () => {
+  const data = { apiKey:'test', enabled:true, consentVersion:2, model:'jev-latest', resetToken:0,
+    cacheVersion:6, cacheModel:'jev-latest', cacheResetToken:0 };
+  for(let i=1;i<=3002;i++) data['cacheEntry:'+i] = { answers: answers(), fingerprint:'a'.repeat(64), at:i };
+  data['cacheEntry:bad']={answers:answers(),fingerprint:'a'.repeat(64),at:999999};
+  const e=await setup({data}); const entries=cacheEntries(e.data);
+  assert.equal(Object.keys(entries).length,3000);
+  assert.equal(entries['1'],undefined); assert.equal(entries['2'],undefined); assert.ok(entries['3002']);
+  assert.equal(Object.hasOwn(e.data,'cacheEntry:bad'),false);
+  assert.ok(Buffer.byteLength(JSON.stringify(entries))<=2*1024*1024);
 });

@@ -1,4 +1,4 @@
-Xtags 0.1.8 — reviewer instructions
+Xtags 0.1.9 — reviewer instructions
 
 This extension has one purpose: display AI-estimated intent labels and related signals beside text posts browsed on X. It does not publish posts, automate likes or follows, or generate replies.
 
@@ -23,7 +23,7 @@ Test steps
 5. Set the signal threshold to 0. This should display all three signal probabilities as labels. Restore it to 0.8. Intent labels remain; signal labels depend on the threshold. These changes reuse cached judgments.
 6. Choose Chinese and then English. Existing labels, tooltips and the status panel should translate without new classification requests.
 7. Turn Enabled off while browsing. New queued requests stop, cancellation is attempted for active requests, and labels are removed. Requests already received by the provider may still be charged.
-8. Turn Enabled on again. Cached judgments can be reused. Clear cache in Settings intentionally discards them and may cause new requests while enabled.
+8. Turn Enabled on again. Cached judgments can be reused. Pause and clear cache in Settings removes them and leaves processing paused; wait for the success message. The API key remains saved. No new classification should start until you enable the extension again.
 9. In Settings, click Withdraw consent and pause. New requests stop; pending results must not be displayed. The key and cache remain available to clear. Read and accept the notice again to resume.
 10. Open two X tabs containing the same post. The background worker shares classification requests/cache and limits global concurrency to three.
 
@@ -32,10 +32,10 @@ Expected limitations
 - Reply detection uses English and Chinese UI text heuristics.
 - Labels are AI estimates, not verified claims about authors or posts.
 - The three warning signals assess textual cues; they do not verify a paid relationship, AI authorship, or whether a post's claims are true.
-- Invalid credentials return an error; correct the key or pause/resume to retry failed posts. Temporary errors have limited retries.
+- Invalid credentials return a controlled error and HTTP status; fix the key or use Retry failed posts in the popup. Transient failures have up to three attempts per round and two further recovery rounds after 15/60 seconds, at most nine API attempts in total. Authentication/permission/format errors do not auto-retry. Pausing stops recovery timers.
 
 Data flow and implementation
-Content scripts on x.com and twitter.com extract text, handles and local post IDs. For collapsed long posts, a packaged page-world script reads the full Note Tweet from X's existing page data before expansion; existing users must renew consent before any classification resumes. The API key stays in chrome.storage.local, restricted to trusted extension contexts. Content scripts receive only non-secret settings and a key-present flag; the background uses the key to send text/handle and fixed questions over HTTPS to api.typesafe.ai/v1/systemone by default. A custom TypeSafe-compatible HTTPS URL can be saved in Settings, with a specific host permission request and fresh destination-bound consent; changing URLs clears the old key and cache. JSON probabilities are validated and rendered locally. The local cache stores a post ID, content fingerprint and judgments, not raw text. All executable logic is in the submitted package; no remote JavaScript is executed. The developer has no server receiving these requests.
+Content scripts on x.com and twitter.com extract text, handles and local post IDs. For collapsed long posts, a packaged page-world script reads the full Note Tweet from X's existing page data before expansion; existing users must renew consent before any classification resumes. The API key stays in chrome.storage.local, restricted to trusted extension contexts. Content scripts receive only non-secret settings and a key-present flag; the background uses the key to send text/handle and fixed questions over HTTPS to api.typesafe.ai/v1/systemone by default. A custom TypeSafe-compatible HTTPS URL can be saved in Settings, with a specific host permission request and fresh destination-bound consent; changing URLs clears the old key and cache. Successful responses are limited to 64 KiB and rebuilt using only required classification/probability fields. HTTP error bodies are not exposed to content scripts or stored as diagnostics. JSON probabilities are validated and rendered locally. The local cache stores a post ID, content fingerprint and judgments, not raw text. All executable logic is in the submitted package; no remote JavaScript is executed. The developer has no server receiving these requests.
 
 Publisher note — remove this paragraph when completing the private dashboard field:
 Complete the remaining pre-submission checklist. Supply working private review credentials and a verified X URL. Check that the published privacy policy URL remains accessible. Do not submit placeholders.

@@ -8,7 +8,7 @@
   :root {
     --ink: #16191c;
     --ink-2: #5a6670;
-    --ink-3: #8b959c;
+    --ink-3: #58656e;
     --rule: #e2e6e8;
     --accent: #0f5f63;
     --alert: #b91c1c;
@@ -209,6 +209,7 @@
   <p id="status" role="status" hidden></p>
   <fieldset id="settings" hidden disabled>
   <h2 data-i18n="preferencesTitle"></h2>
+  <p id="preferencesStatus" role="status" class="hint" hidden></p>
   <label class="field">
     <span class="lab" data-i18n="apiKey"></span>
     <input id="apiKey" type="password" placeholder="ts_..." autocomplete="off" spellcheck="false">
@@ -228,6 +229,7 @@
   <label class="row"><span data-i18n="showHud"></span><input id="showHud" type="checkbox"></label>
 
   <button class="btn" id="reset"></button>
+  <p class="hint" data-i18n="resetHint"></p>
   </fieldset>
 
   <div class="about">
@@ -245,7 +247,7 @@
 
   <script src="../../extension/service.js"></script>
   <script>
-globalThis.chrome={i18n:{getUILanguage:()=>"en"},runtime:{getManifest:()=>({"manifest_version": 3, "minimum_chrome_version": "140", "name": "Xtags", "version": "0.1.8", "description": "__MSG_extensionDescription__", "author": "yishan", "homepage_url": "https://manifoldor.github.io/xtags/", "permissions": ["storage"], "host_permissions": ["https://api.typesafe.ai/*"], "icons": {"16": "icons/on/icon16.png", "32": "icons/on/icon32.png", "48": "icons/on/icon48.png", "128": "icons/on/icon128.png"}, "background": {"service_worker": "background.js"}, "action": {"default_popup": "popup.html", "default_title": "Xtags", "default_icon": {"16": "icons/on/icon16.png", "32": "icons/on/icon32.png"}}, "content_scripts": [{"matches": ["https://x.com/*", "https://twitter.com/*"], "js": ["fulltext.js"], "run_at": "document_start", "world": "MAIN"}, {"matches": ["https://x.com/*", "https://twitter.com/*"], "js": ["service.js", "i18n.js", "content.js"], "run_at": "document_idle"}], "default_locale": "en", "options_ui": {"page": "settings.html", "open_in_tab": true}, "optional_host_permissions": ["https://*/*"]})},
+globalThis.chrome={i18n:{getUILanguage:()=>"en"},runtime:{getManifest:()=>({"manifest_version": 3, "minimum_chrome_version": "140", "name": "Xtags", "version": "0.1.9", "description": "__MSG_extensionDescription__", "author": "yishan", "homepage_url": "https://manifoldor.github.io/xtags/", "permissions": ["storage"], "host_permissions": ["https://api.typesafe.ai/*"], "icons": {"16": "icons/on/icon16.png", "32": "icons/on/icon32.png", "48": "icons/on/icon48.png", "128": "icons/on/icon128.png"}, "background": {"service_worker": "background.js"}, "action": {"default_popup": "popup.html", "default_title": "Xtags", "default_icon": {"16": "icons/on/icon16.png", "32": "icons/on/icon32.png"}}, "content_scripts": [{"matches": ["https://x.com/*", "https://twitter.com/*"], "js": ["fulltext.js"], "run_at": "document_start", "world": "MAIN"}, {"matches": ["https://x.com/*", "https://twitter.com/*"], "js": ["service.js", "i18n.js", "content.js"], "run_at": "document_idle"}], "default_locale": "en", "options_ui": {"page": "settings.html", "open_in_tab": true}, "optional_host_permissions": ["https://*/*"]})},
 storage:{local:{get:async defaults=>({...defaults,language:"en"}),set:async()=>{}},
 onChanged:{addListener:()=>{}}}};
 </script><script src="../../extension/i18n.js"></script>

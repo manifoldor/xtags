@@ -13,7 +13,8 @@ Controls that fit your browsing
 • Skip posts recognized as replies.
 • Adjust the warning-signal threshold.
 • Show or hide the status panel.
-• Reuse locally cached results and clear the cache when needed.
+• Reuse locally cached results. Pause and clear cache stops processing until you enable it again.
+• Check the latest request status and retry failed posts from the popup.
 • Automatically use English or Simplified Chinese based on the browser UI language, or select either language manually.
 
 Getting started
